@@ -16,19 +16,16 @@ from collections.abc import Callable
 
 def features_from_dataset_in_memory(
     features_from_mask:Callable,
-    masks_file:str, 
+    masks:list, 
     filepath:str, 
+    labels:list,
     **kwargs, # kwargs for features_from_mask
 ):
-    logging.info("Features: loading masks..")
-    with np.load(masks_file) as data:
-        masks = data['masks']
-        labels = data['labels']
 
     logging.info("Features: scheduling tasks..")
     tasks = [
-        dask.delayed(features_from_mask)(masks[i,...], **kwargs) 
-        for i in range(masks.shape[0])
+        dask.delayed(features_from_mask)(mask, **kwargs) 
+        for mask in masks
     ]
     logging.info('Features: computing..')
     with ProgressBar():
@@ -41,7 +38,7 @@ def features_from_dataset_in_memory(
     np.savez_compressed(
         filepath, 
         features=feature_matrix, 
-        original_shape=masks.shape[1:], 
+        original_shape=masks[0].shape, 
         labels=labels,
         **kwargs,
     )
