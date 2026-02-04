@@ -1,0 +1,95 @@
+SOPs for maintainers
+********************
+
+Building a virtual environment
+------------------------------
+
+Clone miblab-dl locally
+
+cd to top folder
+
+On windows:
+>>> python -m venv .venv           # create virtual environment
+>>> .venv/Scripts/activate        # activate virtual environment
+
+Then select the Python interpreter in the .venv folder. In VSCode:
+View > Command Palette > Python select interpreter -> enter interpreter path 
+(.venv/Scripts/python.exe)
+
+
+Installation
+------------
+
+Install miblab-dl from source:
+
+>>> pip install -e path\to\miblab-dl
+
+Install dev requirements:
+
+>>> pip install -r dev/requirements.txt
+
+
+Enforce PEP8
+------------
+
+cd to /miblab-package top folder
+
+To fix a single file
+>>> autopep8 src/miblab-package/file.py --in-place
+
+To fix the whole project
+>>> autopep8 src/miblab-package --recursive --in-place --pep8-passes 2000 --verbose
+
+Check any remaining isues and fix manually
+>>> pycodestyle src//miblab-package --ignore=E501
+
+Note agressive option - dangerous - may need debugging. Use carefully and test 
+after changing
+>>> autopep8 src//miblab-package/file.py --in-place --aggressive
+
+
+
+Run test suite and check test coverage
+--------------------------------------
+
+cd to //miblab-package top folder
+>>> pytest --cov=miblab-package --cov-report term-missing
+
+To run a specific file (eg. test_utils) only, do:
+>>> pytest tests/test_utils.py --cov=/miblab-package --cov-report term-missing
+
+
+Check tests in docstrings
+-------------------------
+
+To test file.py, cd to directory of file.py, then do:
+>>> pytest --doctest-modules file.py
+
+To insert the expected test results, do:
+>>> pytest --doctest-modules file.py --accept
+
+
+Creating a new release (from a fork)
+------------------------------------
+
+- Enforce PEP8 (see above)
+- Run the test suite in a clean environment (see above) and check test 
+  coverage (see above)
+- Update the version number in pyproject.toml, push to dev and check that 
+  all tests pass. Fix issues if not.
+- Merge the dev branch with the main branch. 
+- Create a release on github, with the main branch as target.
+- Create a release on PyPI (see below).
+
+
+Creating a PyPi release
+-----------------------
+In the terminal, cd to the /miblab-plot directory, and:
+
+>>> python -m build
+>>> twine upload dist/*
+
+As password paste the API token generated in PyPi miblab repository 
+settings (https://pypi.org/manage/project/miblab/settings/). 
+Note: Paste with Ctrl-V does not work in Windows. Use Edit > Paste via the menu.
+

@@ -1,0 +1,59 @@
+# https://packaging.python.org/en/latest/specifications/pyproject-toml/#pyproject-toml-spec
+
+[build-system]
+build-backend = 'setuptools.build_meta'
+requires = ['setuptools>=61.2']
+
+[project]
+name = "miblab-ssa"
+version = "0.0.0"
+dependencies = [
+  'tqdm',
+  'numpy',
+  'scipy',
+  'scikit-learn',
+  'scikit-image',
+  'trimesh',
+  'dask',
+  'dask-ml',
+  'zarr',
+  'pyshtools',
+  'psutil',
+  'vreg',
+]
+# optional information
+description = "Statistical shape analysis for medical imaging"
+readme = "README.md"
+authors = [
+  { name = "Steven Sourbron", email = "s.sourbron@sheffield.ac.uk" },
+]
+license = "Apache-2.0"
+classifiers = [
+  # How mature is this project? Common values are
+  #   3 - Alpha
+  #   4 - Beta
+  #   5 - Production/Stable
+  'Development Status :: 3 - Alpha',
+
+  # Indicate who your project is intended for
+  'Intended Audience :: Developers',
+  'Intended Audience :: Science/Research',
+  'Topic :: Scientific/Engineering',
+  'Operating System :: OS Independent',
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3"
+]
+keywords = [
+  'python', 
+  "medical imaging",  
+  "MRI",
+]
+
+
+[project.urls]
+"Homepage" = "https://miblab.org/"
+"Source Code" = "https://github.com/openmiblab/pckg-miblab-ssa"
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
