@@ -1,7 +1,7 @@
 from .normalize import (
     normalize_kidney_mask
 )
-from .ssa import (
+from .pca import (
     features_from_dataset_in_memory,
     features_from_dataset_zarr, 
     pca_from_features_zarr, 

@@ -102,72 +102,6 @@ def dice_matrix_in_memory(M:np.ndarray):
 
     return dice_matrix
 
-
-
-
-def get_chunk_size(shape, dtype, max_chunk_size_mb=128):
-    # 1. Dynamically get bytes per voxel
-    bytes_per_voxel = np.dtype(dtype).itemsize
-
-    # shape[-1] is the number of features (voxels)
-    n_features = shape[-1]
-    
-    # 2. Convert MB to Bytes
-    max_bytes = max_chunk_size_mb * 1024 * 1024
-    bytes_per_sample = n_features * bytes_per_voxel
-
-    # 3. Calculate samples and ensure it's at least 1
-    # We use int() because rechunk requires integers
-    n_samples_per_chunk = int(max_bytes // bytes_per_sample)
-    
-    return max(1, n_samples_per_chunk)
-
-
-def dice_matrix_zarr(zarr_path, max_ram=500):
-    # max_ram in MB is the RAM memory occupied by the computation
-    # per worker. This is not counting system overhead so make sure 
-    # to leave a margin for that. 
-
-    # 1. Connect to Zarr
-    d_masks = da.from_zarr(zarr_path, component='masks')
-
-    # 2. Flatten Spatial Dimensions
-    # It is usually safer to reshape BEFORE rechunking 
-    # so we know the exact size of the feature dimension.
-    n_samples = d_masks.shape[0]
-    d_masks = d_masks.reshape(n_samples, -1)
-    
-    # 3. Determine Chunk Size
-    # We use np.int32 because that's what we cast to in step 4
-    max_chunk_size = max_ram / 2
-    n_samples_per_chunk = get_chunk_size(d_masks.shape, np.int32, max_chunk_size)
-
-    # 4. Apply Chunking AND Casting
-    # CRITICAL: {1: -1} ensures the feature dimension is not split.
-    # This makes the dot product significantly faster.
-    d_masks = d_masks.rechunk({0: n_samples_per_chunk, 1: -1}).astype(np.int32)
-
-    # 5. Matrix Multiplication (Lazy)
-    # This computes the dot product: Matrix (N, F) @ Matrix (F, N) = (N, N)
-    intersection_graph = d_masks @ d_masks.T
-
-    print(f"Computing {n_samples}x{n_samples} Dice matrix...")
-    with ProgressBar():
-        # This triggers the parallel computation
-        intersection_matrix = intersection_graph.compute()
-
-    # 6. Compute Dice Score
-    # Dice = (2 * Intersection) / (Vol_A + Vol_B)
-    volumes = intersection_matrix.diagonal()
-    volumes_sum_matrix = volumes[:, None] + volumes[None, :]
-    
-    with np.errstate(divide='ignore', invalid='ignore'):
-        dice = (2 * intersection_matrix) / volumes_sum_matrix
-        
-    return np.nan_to_num(dice, nan=1.0)
-
-
-
 def hausdorff_matrix_in_memory(M, chunk_size = 1000): # (n_subjects, n_voxels)
     # Chunk output to produce less and larger tasks, and less files
     # Otherwise dask takes too long to schedule
@@ -215,6 +149,66 @@ def _hausdorff_matrix_chunk(M, pairs):
         # Add to results
         chunk[(i, j)] = haus_ij
     return chunk
+
+
+
+
+def dice_matrix_zarr(zarr_path, max_ram=512):
+    # max_ram in MB is the RAM memory occupied by the computation
+    # per worker. This is not counting system overhead so make sure 
+    # to leave a margin for that. 
+
+    # 1. Connect to Zarr
+    d_masks = da.from_zarr(zarr_path, component='masks')
+
+    # 2. Flatten Spatial Dimensions
+    # It is usually safer to reshape BEFORE rechunking 
+    # so we know the exact size of the feature dimension.
+    n_samples = d_masks.shape[0]
+    n_features = np.prod(d_masks.shape[1:])
+    
+    # We use int32 (4 bytes). 
+    # n_samples_per_chunk = (max_ram_bytes / 2) / (n_features * 4)
+    limit_bytes = (max_ram * 1024 * 1024) / 2
+    bytes_per_voxel = np.dtype(d_masks.dtype).itemsize
+    bytes_per_sample = n_features * bytes_per_voxel
+    n_samples_per_chunk = max(1, int(limit_bytes // bytes_per_sample))
+
+    logging.info(f"HPC: N={n_samples}, Features={n_features}")
+    logging.info(f"HPC: Using chunk_size of {n_samples_per_chunk} subjects per block.")
+
+    # 3. Flatten and FORCE clean rechunking
+    d_masks = d_masks.reshape(n_samples, -1)
+
+    # We add .astype BEFORE rechunking so the graph stays simple
+    d_masks = d_masks.astype(np.int32)
+
+    # 4. Apply Chunking AND Casting
+    # CRITICAL: {1: -1} ensures the feature dimension is not split.
+    # This makes the dot product significantly faster.
+    d_masks = d_masks.rechunk({0: n_samples_per_chunk, 1: -1})
+
+    # 5. Matrix Multiplication (Lazy)
+    # This computes the dot product: Matrix (N, F) @ Matrix (F, N) = (N, N)
+    intersection_graph = da.dot(d_masks, d_masks.T)
+
+    print(f"Computing {n_samples}x{n_samples} Dice matrix...")
+    with ProgressBar():
+        # This triggers the parallel computation
+        intersection_matrix = intersection_graph.compute()
+
+    # 6. Compute Dice Score
+    # Dice = (2 * Intersection) / (Vol_A + Vol_B)
+    volumes = intersection_matrix.diagonal()
+    volumes_sum_matrix = volumes[:, None] + volumes[None, :]
+    
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dice = (2 * intersection_matrix) / volumes_sum_matrix
+        
+    return np.nan_to_num(dice, nan=1.0)
+
+
+
 
 
 
