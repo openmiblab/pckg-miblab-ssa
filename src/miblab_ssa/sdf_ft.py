@@ -44,7 +44,7 @@ def features_from_mask(mask: np.ndarray, order=16, norm="ortho", saturation_thre
     # Flatten ONLY the valid spherical coefficients
     coeffs_flat = cube_coeffs[mask]
 
-    return coeffs_flat
+    return coeffs_flat.astype(np.float32)
 
 def mask_from_features(coeffs_flat: np.ndarray, shape, order, norm="ortho"):
     # 1. Recreate the Mask

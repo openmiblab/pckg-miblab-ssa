@@ -75,7 +75,7 @@ def features_from_mask(mask, order=15, n_samples=50000, random_seed=42):
     clf = Ridge(alpha=1e-3, fit_intercept=False)
     clf.fit(A, Values)
     
-    return clf.coef_
+    return clf.coef_.astype(np.float32)
 
 def mask_from_features(coeffs, shape, order):
     """

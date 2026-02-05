@@ -44,13 +44,129 @@ def features_from_dataset_in_memory(
     )
     logging.info('Spectral features: finished..')
 
+def pca_from_features_in_memory(feature_file, pca_file):
+    """
+    Fits PCA and saves results while preserving all original metadata.
+    """
+    with np.load(feature_file) as data:
+        features = data['features']
+        original_shape = data['original_shape']
+        labels = data['labels']
+        kwargs = data['kwargs']
+
+    # Fit the PCA
+    pca = PCA()
+    pca.fit(features)
+
+    # This saves the original metadata + the new PCA keys
+    np.savez(pca_file, 
+        mean = pca.mean_,
+        components = pca.components_,
+        variance = pca.explained_variance_,
+        variance_ratio = pca.explained_variance_ratio_, 
+        original_shape = original_shape,
+        labels = labels,
+        kwargs = kwargs,    
+    )
+
+    return pca.explained_variance_ratio_
+
+
+def coefficients_from_features_in_memory(feature_file, pca_file, coeffs_file):
+
+    # Load the features
+    with np.load(feature_file) as data:
+        features = data['features'] # (n_samples, n_features)
+        labels = data['labels']
+
+    # Load the PCA matrices
+    # 1. Load the matrices
+    with np.load(pca_file) as data:
+        mean_vec = data['mean']        # Shape: (n_features,)
+        components = data['components'] # Shape: (n_components, n_features)
+        variance = data['variance']    # Shape: (n_components,)
+
+    # 1. Center the data
+    # Broadcasting handles (N, F) - (F,) automatically
+    centered_features = features - mean_vec
+
+    # 2. Projection (The "Transform" step)
+    # Matrix Multiplication: (N, F) @ (F, K) -> (N, K)
+    scores = centered_features @ components.T
+
+    # 3. Calculate Sigma (Z-Score)
+    # Broadcasting handles (N, K) / (K,) automatically
+    coeffs = scores / np.sqrt(variance)
+
+    np.savez(coeffs_file, coeffs=coeffs, labels=labels)
+
+
+def modes_from_pca_in_memory(
+    mask_from_features: Callable,
+    pca_file, 
+    modes_file, 
+    n_components=8, 
+    n_coeffs=11, 
+    max_coeff=2,
+):
+    # coeffs is list of coefficient vectors
+    # Each coefficient vector has dimensionless coefficients in the components
+    # x_i = mean + α_i * sqrt(variance_i) * component_i
+    coeffs = np.linspace(-max_coeff, max_coeff, n_coeffs)
+
+    with np.load(pca_file) as data:
+        var = data['variance']
+        avr = data['mean']
+        comps = data['components']
+        original_shape = data['original_shape']
+        kwargs = data['kwargs']
+
+    sdev = np.sqrt(var)    # Shape: (n_components,)
+    mask_shape = (n_coeffs, n_components) + tuple(original_shape)
+    masks = np.empty(mask_shape, dtype=bool)
+
+    n_iter = n_coeffs * n_components
+    iterator = product(range(n_coeffs), range(n_components))
+    for j, i in tqdm(iterator, total=n_iter, desc='Computing modes from PCA'):
+        feat = avr + coeffs[j] * sdev[i] * comps[i,:]
+        masks[j,i,...] = mask_from_features(feat, original_shape, **kwargs)
+
+    np.savez(modes_file, masks=masks, coeffs=coeffs)
+
+
+
+# Helper
+def get_chunk_size(shape, dtype, max_chunk_size_mb=128):
+    # 1. Dynamically get bytes per voxel
+    bytes_per_voxel = np.dtype(dtype).itemsize
+
+    # shape[-1] is the number of features (voxels)
+    n_features = shape[-1]
+    
+    # 2. Convert MB to Bytes
+    max_bytes = max_chunk_size_mb * 1024 * 1024
+    bytes_per_sample = n_features * bytes_per_voxel
+
+    # 3. Calculate samples and ensure it's at least 1
+    # We use int() because rechunk requires integers
+    n_samples_per_chunk = int(max_bytes // bytes_per_sample)
+    
+    return max(1, n_samples_per_chunk)
+
+
 
 def features_from_dataset_zarr(
     features_from_mask:Callable,
-    masks_zarr_path: str, 
+    masks_zarr_path: str, # 4D [index, x, y, z]
     output_zarr_path: str, 
-    chunk_size='auto', 
+    max_ram=500, 
     **kwargs, # keyword arguments for features_from_mask
+
+    # NOTE: max_ram in MB is the maximum RAM memory occupied by the computation
+    # per worker for any computations. This is not counting system overhead so make sure 
+    # to leave a margin for that. 
+
+    # We are setting this up front so there is no need for rechunking later
 ):
     logging.info(f"Feature calc: connecting to {os.path.basename(masks_zarr_path)}..")
     
@@ -103,19 +219,23 @@ def features_from_dataset_zarr(
     root = zarr.group(store=store, overwrite=True)
 
     # 5. Output Chunking logic
-    # If the output matrix is huge, we should chunk it sensibly on disk.
-    # Defaulting to None lets Dask decide, or we can enforce typical sizes.
-    # If 'auto', we let Dask decide based on the input chunks.
-    if chunk_size != 'auto':
-        d_feature_matrix = d_feature_matrix.rechunk({0: chunk_size})
+    max_chunk_size = max_ram / 2
+    n_samples_per_chunk = get_chunk_size(d_feature_matrix.shape, d_feature_matrix.dtype, max_chunk_size)
+    d_feature_matrix = d_feature_matrix.rechunk({0: n_samples_per_chunk, 1: -1})
 
     logging.info(f"Feature calc: Streaming results to {output_zarr_path}...")
-    
+
     # 6. Execution: Stream to Disk
-    # .to_zarr computes the chunks in parallel and writes them directly to disk.
-    # It never holds the full matrix in memory.
+    # IMPORTANT: Pass the compressor here to save space on the feature vectors
+    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
+    
     with ProgressBar():
-        d_feature_matrix.to_zarr(store, component='features', compute=True)
+        d_feature_matrix.to_zarr(
+            store, 
+            component='features', 
+            compute=True, 
+            compressor=compressor
+        )    
 
     # 7. Metadata: Save labels and attributes
     # Copy labels from input to output
@@ -131,40 +251,10 @@ def features_from_dataset_zarr(
 
 
 
-def pca_from_features_in_memory(feature_file, pca_file):
-    """
-    Fits PCA and saves results while preserving all original metadata.
-    """
-    with np.load(feature_file) as data:
-        features = data['features']
-        original_shape = data['original_shape']
-        labels = data['labels']
-        kwargs = data['kwargs']
-
-    # Fit the PCA
-    pca = PCA()
-    pca.fit(features)
-
-    # This saves the original metadata + the new PCA keys
-    np.savez(pca_file, 
-        mean = pca.mean_,
-        components = pca.components_,
-        variance = pca.explained_variance_,
-        variance_ratio = pca.explained_variance_ratio_, 
-        original_shape = original_shape,
-        labels = labels,
-        kwargs = kwargs,    
-    )
-
-    return pca.explained_variance_ratio_
-
-
-
 def pca_from_features_zarr(
     features_zarr_path: str, 
     output_zarr_path: str, 
     n_components=None,
-    chunk_size='auto'
 ):
     """
     Fits PCA on a large-than-memory features Zarr array and saves results to Zarr.
@@ -174,23 +264,8 @@ def pca_from_features_zarr(
     # 1. Connect to Features
     # Note: Component must match what was saved in the previous step ('features')
     d_features = da.from_zarr(features_zarr_path, component='features')
-    
-    # 2. Optimize Chunking
-    if chunk_size == 'auto':
-        chunk_size = get_optimal_chunk_size(
-            d_features.shape[1:], 
-            dtype=d_features.dtype
-        )
-        logging.info(f"PCA: Auto-chunking set to {chunk_size} samples per batch.")
-
-    d_features = d_features.rechunk({0: chunk_size})
-
-    # 3. Fit PCA
-    if n_components is None:
-        n_components = min(d_features.shape)
         
-    logging.info(f"PCA: Fitting model with n_components={n_components}...")
-    
+    logging.info(f"PCA: Fitting model...")
     # svd_solver='randomized' is efficient for large Dask arrays
     pca = DaskPCA(n_components=n_components, svd_solver='auto')
     
@@ -198,7 +273,6 @@ def pca_from_features_zarr(
     # Note: pca.components_ becomes a NumPy array in RAM after this.
     pca.fit(d_features)
 
-    # --- FIX STARTS HERE ---
     # dask_ml keeps attributes as lazy arrays. We must compute them to get NumPy arrays.
     logging.info("PCA: Computing attributes (mean, components) into memory...")
     
@@ -211,7 +285,6 @@ def pca_from_features_zarr(
         pca.explained_variance_, 
         pca.explained_variance_ratio_
     )
-    # --- FIX ENDS HERE ---
     
     # 4. Prepare Output Zarr
     logging.info(f"PCA: Saving results to {output_zarr_path}...")
@@ -257,40 +330,13 @@ def pca_from_features_zarr(
     return pca_ratio
 
 
-def coefficients_from_features_in_memory(feature_file, pca_file, coeffs_file):
 
-    # Load the features
-    with np.load(feature_file) as data:
-        features = data['features'] # (n_samples, n_features)
-        labels = data['labels']
-
-    # Load the PCA matrices
-    # 1. Load the matrices
-    with np.load(pca_file) as data:
-        mean_vec = data['mean']        # Shape: (n_features,)
-        components = data['components'] # Shape: (n_components, n_features)
-        variance = data['variance']    # Shape: (n_components,)
-
-    # 1. Center the data
-    # Broadcasting handles (N, F) - (F,) automatically
-    centered_features = features - mean_vec
-
-    # 2. Projection (The "Transform" step)
-    # Matrix Multiplication: (N, F) @ (F, K) -> (N, K)
-    scores = centered_features @ components.T
-
-    # 3. Calculate Sigma (Z-Score)
-    # Broadcasting handles (N, K) / (K,) automatically
-    coeffs = scores / np.sqrt(variance)
-
-    np.savez(coeffs_file, coeffs=coeffs, labels=labels)
 
 
 def coefficients_from_features_zarr(
     features_zarr_path: str, 
     pca_zarr_path: str, 
     output_zarr_path: str,
-    chunk_size='auto'
 ):
     """
     Computes PCA coefficients (scores normalized by variance) from Zarr inputs
@@ -312,16 +358,6 @@ def coefficients_from_features_zarr(
     mean_vec = z_pca['mean'][:]            # (F,)
     components = z_pca['components'][:]    # (K, F)
     variance = z_pca['variance'][:]        # (K,)
-    
-    # 2. Rechunk Features
-    # We apply the same optimization logic as before to handle large N
-    if chunk_size == 'auto':
-        chunk_size = get_optimal_chunk_size(
-            d_features.shape[1:], 
-            dtype=d_features.dtype
-        )
-    
-    d_features = d_features.rechunk({0: chunk_size})
 
     # 3. Define the Computation (Lazy Graph)
     
@@ -360,37 +396,6 @@ def coefficients_from_features_zarr(
 
 
 
-def modes_from_pca_in_memory(
-    mask_from_features: Callable,
-    pca_file, 
-    modes_file, 
-    n_components=8, 
-    n_coeffs=11, 
-    max_coeff=2,
-):
-    # coeffs is list of coefficient vectors
-    # Each coefficient vector has dimensionless coefficients in the components
-    # x_i = mean + α_i * sqrt(variance_i) * component_i
-    coeffs = np.linspace(-max_coeff, max_coeff, n_coeffs)
-
-    with np.load(pca_file) as data:
-        var = data['variance']
-        avr = data['mean']
-        comps = data['components']
-        original_shape = data['original_shape']
-        kwargs = data['kwargs']
-
-    sdev = np.sqrt(var)    # Shape: (n_components,)
-    mask_shape = (n_coeffs, n_components) + tuple(original_shape)
-    masks = np.empty(mask_shape, dtype=bool)
-
-    n_iter = n_coeffs * n_components
-    iterator = product(range(n_coeffs), range(n_components))
-    for j, i in tqdm(iterator, total=n_iter, desc='Computing modes from PCA'):
-        feat = avr + coeffs[j] * sdev[i] * comps[i,:]
-        masks[j,i,...] = mask_from_features(feat, original_shape, **kwargs)
-
-    np.savez(modes_file, masks=masks, coeffs=coeffs)
 
 
 
@@ -486,37 +491,3 @@ def modes_from_pca_zarr(
 
     logging.info("Modes: Finished.")
 
-
-
-
-
-# Helper function
-def get_optimal_chunk_size(shape, dtype, target_mb=250):
-    """
-    Calculates the optimal number of masks per chunk based on the specific dtype size.
-    """
-    # 1. Dynamically get bytes per voxel based on the dtype argument
-    # np.int32 -> 4 bytes
-    # np.float64 -> 8 bytes
-    # np.bool_ -> 1 byte
-    bytes_per_voxel = np.dtype(dtype).itemsize
-    
-    # 2. Calculate size of ONE mask in Megabytes (MB)
-    one_mask_bytes = np.prod(shape) * bytes_per_voxel
-    one_mask_mb = one_mask_bytes / (1024**2)
-    
-    # 3. Constraint A: Dask Target Size (~250MB)
-    if one_mask_mb > target_mb:
-        dask_optimal_count = 1
-    else:
-        dask_optimal_count = int(target_mb / one_mask_mb)
-
-    # 4. Constraint B: System RAM Safety Net (10% of Available RAM)
-    available_ram_mb = psutil.virtual_memory().available / (1024**2)
-    safe_ram_limit_mb = available_ram_mb * 0.10
-    ram_limited_count = int(safe_ram_limit_mb / one_mask_mb)
-    
-    # 5. Pick the safer number
-    final_count = min(dask_optimal_count, ram_limited_count)
-    
-    return max(1, final_count)

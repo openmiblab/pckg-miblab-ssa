@@ -105,70 +105,59 @@ def dice_matrix_in_memory(M:np.ndarray):
 
 
 
-
-
-def get_optimal_chunk_size(shape, dtype, target_mb=250):
-    """
-    Calculates the optimal number of masks per chunk based on the specific dtype size.
-    """
-    # 1. Dynamically get bytes per voxel based on the dtype argument
-    # np.int32 -> 4 bytes
-    # np.float64 -> 8 bytes
-    # np.bool_ -> 1 byte
+def get_chunk_size(shape, dtype, max_chunk_size_mb=128):
+    # 1. Dynamically get bytes per voxel
     bytes_per_voxel = np.dtype(dtype).itemsize
-    
-    # 2. Calculate size of ONE mask in Megabytes (MB)
-    one_mask_bytes = np.prod(shape) * bytes_per_voxel
-    one_mask_mb = one_mask_bytes / (1024**2)
-    
-    # 3. Constraint A: Dask Target Size (~250MB)
-    if one_mask_mb > target_mb:
-        dask_optimal_count = 1
-    else:
-        dask_optimal_count = int(target_mb / one_mask_mb)
 
-    # 4. Constraint B: System RAM Safety Net (10% of Available RAM)
-    available_ram_mb = psutil.virtual_memory().available / (1024**2)
-    safe_ram_limit_mb = available_ram_mb * 0.10
-    ram_limited_count = int(safe_ram_limit_mb / one_mask_mb)
+    # shape[-1] is the number of features (voxels)
+    n_features = shape[-1]
     
-    # 5. Pick the safer number
-    final_count = min(dask_optimal_count, ram_limited_count)
+    # 2. Convert MB to Bytes
+    max_bytes = max_chunk_size_mb * 1024 * 1024
+    bytes_per_sample = n_features * bytes_per_voxel
+
+    # 3. Calculate samples and ensure it's at least 1
+    # We use int() because rechunk requires integers
+    n_samples_per_chunk = int(max_bytes // bytes_per_sample)
     
-    return max(1, final_count)
+    return max(1, n_samples_per_chunk)
 
 
-def dice_matrix_zarr(zarr_path, chunk_size='auto'):
-    """
-    Computes Dice similarity matrix with auto-optimized memory chunking.
-    """
+def dice_matrix_zarr(zarr_path, max_ram=500):
+    # max_ram in MB is the RAM memory occupied by the computation
+    # per worker. This is not counting system overhead so make sure 
+    # to leave a margin for that. 
+
     # 1. Connect to Zarr
     d_masks = da.from_zarr(zarr_path, component='masks')
+
+    # 2. Flatten Spatial Dimensions
+    # It is usually safer to reshape BEFORE rechunking 
+    # so we know the exact size of the feature dimension.
+    n_samples = d_masks.shape[0]
+    d_masks = d_masks.reshape(n_samples, -1)
     
-    # 2. Determine Chunk Size
-    if chunk_size == 'auto':
-        # Note: We pass d_masks.shape[1:] to exclude the 'N' dimension (we just want D,H,W)
-        chunk_size = get_optimal_chunk_size(d_masks.shape[1:], dtype=np.int32)
-        
-        print(f"Auto-configured chunk_size: {chunk_size} masks")
+    # 3. Determine Chunk Size
+    # We use np.int32 because that's what we cast to in step 4
+    max_chunk_size = max_ram / 2
+    n_samples_per_chunk = get_chunk_size(d_masks.shape, np.int32, max_chunk_size)
 
-    # 3. Flatten Spatial Dimensions
-    d_masks = d_masks.reshape(d_masks.shape[0], -1)
+    # 4. Apply Chunking AND Casting
+    # CRITICAL: {1: -1} ensures the feature dimension is not split.
+    # This makes the dot product significantly faster.
+    d_masks = d_masks.rechunk({0: n_samples_per_chunk, 1: -1}).astype(np.int32)
 
-    # 4. Apply Chunking
-    d_masks = d_masks.rechunk({0: chunk_size})
-
-    # 5. Cast to int32
-    d_masks = d_masks.astype(np.int32)
-
-    # 6. Matrix Multiplication (Lazy)
+    # 5. Matrix Multiplication (Lazy)
+    # This computes the dot product: Matrix (N, F) @ Matrix (F, N) = (N, N)
     intersection_graph = d_masks @ d_masks.T
 
-    print(f"Computing {d_masks.shape[0]}x{d_masks.shape[0]} Dice matrix...")
+    print(f"Computing {n_samples}x{n_samples} Dice matrix...")
     with ProgressBar():
+        # This triggers the parallel computation
         intersection_matrix = intersection_graph.compute()
 
-    # 7. Compute Dice Score
+    # 6. Compute Dice Score
+    # Dice = (2 * Intersection) / (Vol_A + Vol_B)
     volumes = intersection_matrix.diagonal()
     volumes_sum_matrix = volumes[:, None] + volumes[None, :]
     
@@ -176,6 +165,7 @@ def dice_matrix_zarr(zarr_path, chunk_size='auto'):
         dice = (2 * intersection_matrix) / volumes_sum_matrix
         
     return np.nan_to_num(dice, nan=1.0)
+
 
 
 def hausdorff_matrix_in_memory(M, chunk_size = 1000): # (n_subjects, n_voxels)
