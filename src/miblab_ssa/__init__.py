@@ -12,4 +12,7 @@ from .metrics import (
     hausdorff_matrix_zarr,
     dice_matrix_zarr
 )
+from .data import (
+    save_masks_as_zarr,
+)
 from . import sdf_ft, sdf_cheby, lb, zernike
