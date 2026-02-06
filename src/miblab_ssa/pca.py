@@ -147,17 +147,11 @@ def features_from_dataset_zarr(
     
     # 1. Input: Connect to the Masks Zarr (Lazy)
     d_masks = da.from_zarr(masks_zarr_path, component='masks')
-    n_samples = d_masks.shape[0]
-    
-    # Adopt the chunk size from the source data
-    # This matches the n_samples_per_chunk you used in Stage 9
-    inherited_chunk_size = d_masks.chunks[0][0]
 
     # 2. Metadata Shape Probe
     logging.info("Feature calc: computing shape probe on first mask..")
     sample_mask = d_masks[0].compute() 
     sample_feature = features_from_mask(sample_mask, **kwargs)
-    
     n_features = sample_feature.shape[0]
     dtype = sample_feature.dtype
     logging.info(f"Feature vector shape: ({n_features},). Type: {dtype}")
@@ -166,19 +160,15 @@ def features_from_dataset_zarr(
     lazy_rows = []
     delayed_func = dask.delayed(features_from_mask)
 
-    for i in range(n_samples):
-        # Passing d_masks[i] maintains the lazy graph connection
+    for i in range(d_masks.shape[0]):
         task = delayed_func(d_masks[i], **kwargs)
         d_row = da.from_delayed(task, shape=(n_features,), dtype=dtype)
         lazy_rows.append(d_row[None, :]) 
 
     # 4. Final Array Creation
     d_feature_matrix = da.vstack(lazy_rows)
-    
-    # Re-align the graph to the inherited chunk size
-    d_feature_matrix = d_feature_matrix.rechunk({0: inherited_chunk_size, 1: -1})
 
-    # 5. Storage Preparation
+    # 4. Storage Preparation
     if not output_zarr_path.endswith('.zarr'):
         output_zarr_path += '.zarr'
         
@@ -187,7 +177,7 @@ def features_from_dataset_zarr(
     compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
 
     # 6. Execution: Stream to Disk
-    logging.info(f"Streaming to disk using chunks of {inherited_chunk_size}...")
+    logging.info(f"Streaming to disk...")
     with ProgressBar():
         d_feature_matrix.to_zarr(
             store, 

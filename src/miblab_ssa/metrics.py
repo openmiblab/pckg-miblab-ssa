@@ -150,65 +150,32 @@ def _hausdorff_matrix_chunk(M, pairs):
         chunk[(i, j)] = haus_ij
     return chunk
 
-
 def dice_matrix_zarr(zarr_path):
-    # 1. Connect to Zarr
+    # 1. Load with specific chunks: 1 sample per chunk, full spatial info
+    # This is the 'Tall-Skinny' orientation
     d_masks = da.from_zarr(zarr_path, component='masks')
     
-    # Flatten
-    n_samples = d_masks.shape[0]
-    d_masks = d_masks.reshape(n_samples, -1).astype(np.int32)
+    # Flattening (N, 301, 301, 301) -> (N, 27270901)
+    d_masks_flat = d_masks.astype(np.int32).reshape(d_masks.shape[0], -1)
 
-    # Matrix Multiplication
-    intersection_graph = da.dot(d_masks, d_masks.T)
+    # 2. Perform the Dot Product Lazily
+    # Dask will only compute pieces of this matrix as needed
+    intersection_matrix_lazy = da.dot(d_masks_flat, d_masks_flat.T)
 
-    print(f"Computing Dice matrix...")
-    with ProgressBar():
-        intersection_matrix = intersection_graph.compute()
-
-    # 7. Rest of the Dice logic...
-    volumes = intersection_matrix.diagonal()
+    # 3. Compute Dice logic within Dask (stay lazy as long as possible)
+    volumes = da.diag(intersection_matrix_lazy)
     volumes_sum_matrix = volumes[:, None] + volumes[None, :]
-    with np.errstate(divide='ignore', invalid='ignore'):
-        dice = (2 * intersection_matrix) / volumes_sum_matrix
-        
-    return np.nan_to_num(dice, nan=1.0)
-
-def dice_matrix_zarr(zarr_path):
-    # 1. Connect
-    d_masks = da.from_zarr(zarr_path, component='masks')
-    n_samples = d_masks.shape[0]
     
-    # 2. Flatten and cast to int32 (4 bytes per voxel)
-    # We use int32 because boolean True + True = 2 for intersection
-    d_masks_flat = d_masks.reshape(n_samples, -1).astype(np.int32)
+    # 4. Final Computation
+    # This is where the heavy lifting happens. 
+    # Dask will stream chunks from disk, multiply them, and discard them.
+    dice_lazy = (2 * intersection_matrix_lazy) / volumes_sum_matrix
     
-    # 3. Calculate intersections manually via block-wise map_blocks
-    # This prevents the 'factor of 124' rechunking warning
-    logging.info("Computing Intersection Matrix...")
-    
-    # intersection = d_masks_flat @ d_masks_flat.T
-    # But we use the governor to ensure it's calculated in pieces
+    logging.info(f"Computing dice...")
     with ProgressBar():
-        # Force Dask to compute the dot product block-by-block
-        # to avoid the intermediate 'shuffle' that causes the OOM
-        intersections = da.matmul(d_masks_flat, d_masks_flat.T).compute()
-
-    # 4. Sums for Dice Denominator
-    logging.info("Computing sums...")
-    sums = d_masks_flat.sum(axis=1).compute()
-        
-    # 5. Final Dice Calculation (NumPy level)
-    # Dice = (2 * intersect) / (sum_a + sum_b)
-    logging.info("Finalizing Dice values...")
-    dice = (2.0 * intersections) / (sums[:, None] + sums[None, :])
+        dice = dice_lazy.compute() 
     
-    # Replace NaNs (if any empty masks exist)
-    dice = np.nan_to_num(dice)
-    
-    return dice
-
-
+    return np.nan_to_num(dice, nan=1.0)
 
 
 
