@@ -18,7 +18,7 @@ def save_masks_as_zarr(zarr_path, masks: list, labels: list, key='values'):
     # to avoid OOM (Out Of Memory) errors during the dot product
     # We use half of available memory as limit because some 
     # calculations like DICE load two chunks
-    usable_mem_gb = (mem_gb / 2) * 0.8
+    usable_mem_gb = (mem_gb / 4) * 0.8
     
     logging.info(f"Detected {mem_gb:.2f} GB RAM. Using {usable_mem_gb:.2f} GB for chunk calculation.")
 

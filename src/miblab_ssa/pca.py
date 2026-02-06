@@ -154,7 +154,7 @@ def features_from_dataset_zarr(
     # 1. Connect and Detect Memory
     d_masks = da.from_zarr(masks_zarr_path, component='masks')
     mem_gb = utils.get_memory_limit()
-    usable_mem_gb = (mem_gb / 2) * 0.8
+    usable_mem_gb = (mem_gb / 4) * 0.8
 
     # 2. Metadata Shape Probe
     sample_mask = d_masks[0].compute() 
