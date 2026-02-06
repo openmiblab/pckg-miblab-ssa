@@ -174,6 +174,40 @@ def dice_matrix_zarr(zarr_path):
         
     return np.nan_to_num(dice, nan=1.0)
 
+def dice_matrix_zarr(zarr_path):
+    # 1. Connect
+    d_masks = da.from_zarr(zarr_path, component='masks')
+    n_samples = d_masks.shape[0]
+    
+    # 2. Flatten and cast to int32 (4 bytes per voxel)
+    # We use int32 because boolean True + True = 2 for intersection
+    d_masks_flat = d_masks.reshape(n_samples, -1).astype(np.int32)
+    
+    # 3. Calculate intersections manually via block-wise map_blocks
+    # This prevents the 'factor of 124' rechunking warning
+    logging.info("Computing Intersection Matrix...")
+    
+    # intersection = d_masks_flat @ d_masks_flat.T
+    # But we use the governor to ensure it's calculated in pieces
+    with ProgressBar():
+        # Force Dask to compute the dot product block-by-block
+        # to avoid the intermediate 'shuffle' that causes the OOM
+        intersections = da.matmul(d_masks_flat, d_masks_flat.T).compute()
+
+    # 4. Sums for Dice Denominator
+    logging.info("Computing sums...")
+    sums = d_masks_flat.sum(axis=1).compute()
+        
+    # 5. Final Dice Calculation (NumPy level)
+    # Dice = (2 * intersect) / (sum_a + sum_b)
+    logging.info("Finalizing Dice values...")
+    dice = (2.0 * intersections) / (sums[:, None] + sums[None, :])
+    
+    # Replace NaNs (if any empty masks exist)
+    dice = np.nan_to_num(dice)
+    
+    return dice
+
 
 
 
