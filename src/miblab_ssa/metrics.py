@@ -7,6 +7,10 @@ from dask.diagnostics import ProgressBar
 import dask.array as da
 import psutil
 import zarr
+import numpy as np
+import logging
+from multiprocessing import Pool
+from tqdm import tqdm
 
 
 def dice_coefficient(vol_a, vol_b):
@@ -65,52 +69,89 @@ def surface_distances(vol_a, vol_b, spacing=(1.0,1.0,1.0)):
     return hausdorff, mean_dist
 
 
-def dice_matrix_in_memory(M:np.ndarray):
+
+import numpy as np
+import dask
+import logging
+from dask.diagnostics import ProgressBar
+
+def load_mask_npz(path, key):
+    """Simple loader for a single NPZ file."""
+    with np.load(path) as data:
+        # Load as bool to keep the initial transfer lean
+        return data[key].astype(bool)
+
+def dice_matrix_npz(mask_paths, key='values'):
     """
-    Computes a Dice similarity matrix for all numpy masks in a folder using 
-    vectorized sparse matrix multiplication.
+    NPZ + Dask Delayed Baseline:
+    1. Uses dask.delayed to parallelize the loading of NPZ files.
+    2. Computes the list into a single NumPy array.
+    3. Performs the Dice calculation in-memory.
     """
-    # Esure the matrix is 2D
-    M = M.reshape((M.shape[0], -1))
+    n_samples = len(mask_paths)
+    logging.info(f"Delayed Baseline: Building graph for {n_samples} masks...")
 
-    # Convert from Boolean (True/False) to Integer (1/0)
-    # This ensures the dot product counts overlapping voxels.
-    M = M.astype(np.int32)
-    
-    # 3. Vectorized Intersection Calculation (Matrix Multiplication)
-    # Intersections[i, j] = dot_product(mask_i, mask_j)
-    # This replaces the nested loop. M.T means M transpose.
-    intersection_matrix = M @ M.T
-    
-    # 4. Compute Dice Score
-    # Formula: 2 * (A n B) / (|A| + |B|)
-    
-    # The diagonal of the intersection matrix represents |A n A|, which is just |A| (the volume)
-    volumes = intersection_matrix.diagonal()
-    
-    # Broadcasting sum: creates a matrix where cell [i,j] = volume[i] + volume[j]
-    volumes_sum_matrix = volumes[:, None] + volumes[None, :]
-    
-    # Avoid division by zero (though volumes shouldn't be 0 for valid masks)
-    # If both volumes are 0, Dice is technically 1.0 (empty matches empty), 
-    # but usually we handle this based on context. Here we use np.errstate to handle specific cases.
-    with np.errstate(divide='ignore', invalid='ignore'):
-        dice_matrix = (2 * intersection_matrix) / volumes_sum_matrix
-        
-    # Handle NaN cases where volumes_sum_matrix might be 0
-    dice_matrix = np.nan_to_num(dice_matrix, nan=1.0)
+    # 1. Create a list of delayed tasks
+    lazy_masks = [dask.delayed(load_mask_npz)(p, key) for p in mask_paths]
 
-    return dice_matrix
+    # 2. Parallel Compute into RAM
+    # This triggers the actual loading across your available workers/threads
+    logging.info("Executing parallel load into RAM...")
+    with ProgressBar():
+        # dask.compute returns a list of NumPy arrays
+        mask_list = dask.compute(*lazy_masks)
 
-def hausdorff_matrix_in_memory(M, chunk_size = 1000): # (n_subjects, n_voxels)
+    # 3. Stack and Flatten (N, D, H, W) -> (N, Voxels)
+    logging.info("Stacking and flattening masks...")
+    masks_flat = np.stack(mask_list).reshape(n_samples, -1)
+    del mask_list # Clear the list of individual arrays
+
+    # 4. Math: In-memory Volumes and Intersections
+    logging.info("Calculating volumes...")
+    volumes = masks_flat.sum(axis=1).astype(np.float32)
+
+    logging.info("Computing intersections (np.dot)...")
+    # We cast to float32 right at the multiplication step
+    intersections = np.dot(masks_flat.astype(np.float32), 
+                           masks_flat.T.astype(np.float32))
+
+    # 5. Final Dice Calculation
+    logging.info("Finalizing Dice matrix...")
+    v_sum = volumes[:, None] + volumes[None, :]
+    dice = (2 * intersections) / v_sum
+    
+    return np.nan_to_num(dice, nan=1.0)
+
+
+
+
+def hausdorff_matrix_npz(mask_paths, key='values', chunk_size = 1000): # (n_subjects, n_voxels)
     # Chunk output to produce less and larger tasks, and less files
     # Otherwise dask takes too long to schedule
 
+    n_samples = len(mask_paths)
+    logging.info(f"Delayed Baseline: Building graph for {n_samples} masks...")
+
+    # 1. Create a list of delayed tasks
+    lazy_masks = [dask.delayed(load_mask_npz)(p, key) for p in mask_paths]
+
+    # 2. Parallel Compute into RAM
+    # This triggers the actual loading across your available workers/threads
+    logging.info("Executing parallel load into RAM...")
+    with ProgressBar():
+        # dask.compute returns a list of NumPy arrays
+        mask_list = dask.compute(*lazy_masks)
+
+    # 3. Stack and Flatten (N, D, H, W) -> (N, Voxels)
+    logging.info("Stacking and flattening masks...")
+    masks_flat = np.stack(mask_list).reshape(n_samples, -1)
+    del mask_list # Clear the list of individual arrays
+
     # Convert from Boolean (True/False) to Integer (1/0)
     # This ensures the dot product counts overlapping voxels.
-    M = M.astype(np.int32)
+    masks_flat = masks_flat.astype(np.float32)
     
-    n = M.shape[0]
+    n = masks_flat.shape[0]
     # Build a list of all index pairs in the sorted list that need computing
     # Since the matrix is symmetric only half needs to be computed
     pairs = [(i, j) for i in range(n) for j in range(i, n)]
@@ -120,7 +161,7 @@ def hausdorff_matrix_in_memory(M, chunk_size = 1000): # (n_subjects, n_voxels)
     # Compute dice scores for each chunk in parallel
     logging.info("Hausdorff matrix - scheduling tasks..")
     tasks = [
-        dask.delayed(_hausdorff_matrix_chunk)(M, chunk) 
+        dask.delayed(_hausdorff_matrix_chunk)(masks_flat, chunk) 
         for chunk in chunks
     ]
     logging.info("Hausdorff matrix - computing tasks..")
@@ -151,30 +192,34 @@ def _hausdorff_matrix_chunk(M, pairs):
     return chunk
 
 
-def dice_matrix_zarr(zarr_path):
-    # Load with your original 1-sample chunks
+
+def dice_matrix_zarr(zarr_path, block_size=100):
     d_masks = da.from_zarr(zarr_path, component='masks')
-
-    # Now flatten
-    d_masks_flat = d_masks.astype(np.float32).reshape(d_masks.shape[0], -1)
-
-    # 2. Perform the Dot Product Lazily
-    # Dask will only compute pieces of this matrix as needed
-    intersection_matrix_lazy = da.dot(d_masks_flat, d_masks_flat.T)
-
-    # 3. Compute Dice logic within Dask (stay lazy as long as possible)
-    volumes = da.diag(intersection_matrix_lazy)
-    volumes_sum_matrix = volumes[:, None] + volumes[None, :]
+    n_samples = d_masks.shape[0]
     
-    # 4. Final Computation
-    # This is where the heavy lifting happens. 
-    # Dask will stream chunks from disk, multiply them, and discard them.
-    dice_lazy = (2 * intersection_matrix_lazy) / volumes_sum_matrix
+    # Pre-calculate volumes (1D is always safe)
+    volumes = d_masks.sum(axis=(1, 2, 3)).compute().astype(np.float32)
     
-    logging.info(f"Computing dice...")
-    with ProgressBar():
-        dice = dice_lazy.compute() 
+    # Flatten masks (N, Voxels)
+    d_masks_flat = d_masks.reshape(n_samples, -1).astype(np.float32)
     
+    # Initialize the result matrix in NumPy (only ~5MB for 1108x1108)
+    intersections = np.zeros((n_samples, n_samples), dtype=np.float32)
+    
+    logging.info(f"Computing Dice in blocks of {block_size} rows...")
+    
+    # We process 100 rows at a time. 
+    # This keeps the Dask Task Graph small and manageable for the Scheduler.
+    for i in range(0, n_samples, block_size):
+        end_i = min(i + block_size, n_samples)
+        
+        # This dot product is (Block, Voxels) @ (Voxels, N)
+        # It creates ~110k tasks instead of 1.2M tasks.
+        block_intersections = da.matmul(d_masks_flat[i:end_i], d_masks_flat.T).compute()
+        intersections[i:end_i, :] = block_intersections
+        
+    v_sum = volumes[:, None] + volumes[None, :]
+    dice = (2 * intersections) / v_sum
     return np.nan_to_num(dice, nan=1.0)
 
 
