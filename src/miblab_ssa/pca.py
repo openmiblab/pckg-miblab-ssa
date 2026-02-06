@@ -13,6 +13,11 @@ from dask_ml.decomposition import PCA as DaskPCA
 import numpy as np
 import psutil
 from collections.abc import Callable
+import dask.array as da
+import dask.delayed
+import math
+
+from miblab_ssa import utils
 
 
 def features_from_dataset_in_memory(
@@ -137,7 +142,78 @@ def modes_from_pca_in_memory(
 
 
 
+
 def features_from_dataset_zarr(
+    features_from_mask: Callable,
+    masks_zarr_path: str,
+    output_zarr_path: str,
+    **kwargs,
+):
+    logging.info(f"Feature calc: connecting to {os.path.basename(masks_zarr_path)}..")
+    
+    # 1. Connect and Detect Memory
+    d_masks = da.from_zarr(masks_zarr_path, component='masks')
+    mem_gb = utils.get_memory_limit()
+    usable_mem_gb = (mem_gb / 2) * 0.8
+
+    # 2. Metadata Shape Probe
+    sample_mask = d_masks[0].compute() 
+    sample_feature = features_from_mask(sample_mask, **kwargs)
+    n_features = sample_feature.shape[0]
+    dtype = sample_feature.dtype
+    logging.info(f"Feature vector shape: ({n_features},). Type: {dtype}")
+    
+    # 3. Calculate Optimal Chunk Size for the Output Matrix
+    # We want the chunks of the feature matrix to be manageable for downstream PCA/Stats
+    bytes_per_row = n_features * sample_feature.itemsize
+    # Aim for ~100MB chunks (sweet spot for Dask dataframes/matrices) or based on RAM
+    samples_per_chunk = max(1, math.floor(usable_mem_gb * 1024**3 / bytes_per_row))
+    samples_per_chunk = min(samples_per_chunk, d_masks.shape[0])
+
+    logging.info(f"Feature matrix chunks: ({samples_per_chunk}, {n_features})")
+
+    # 4. Construction: Build the Dask Graph
+    delayed_func = dask.delayed(features_from_mask)
+    lazy_rows = []
+    for i in range(d_masks.shape[0]):
+        # We pass the delayed task into the array
+        task = delayed_func(d_masks[i], **kwargs)
+        d_row = da.from_delayed(task, shape=(n_features,), dtype=dtype)
+        lazy_rows.append(d_row) 
+
+    # Stack and RECHUNK immediately
+    # This ensures that when to_zarr is called, Dask writes in the calculated block sizes
+    d_feature_matrix = da.stack(lazy_rows).rechunk({0: samples_per_chunk, 1: -1})
+
+    # 5. Storage Preparation
+    if not output_zarr_path.endswith('.zarr'):
+        output_zarr_path += '.zarr'
+
+    store = zarr.DirectoryStore(output_zarr_path)
+    root = zarr.group(store=store, overwrite=True)        
+    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
+
+    # 6. Execution: Stream to Disk
+    logging.info(f"Streaming features to disk at {output_zarr_path}...")
+    with ProgressBar():
+        # Dask will use the rechunked structure to determine the Zarr chunks automatically
+        d_feature_matrix.to_zarr(
+            store, 
+            component='features', 
+            overwrite=True,
+            compressor=compressor
+        )    
+
+    # 7. Metadata Transfer
+    input_root = zarr.open(masks_zarr_path, mode='r')
+    root.array('labels', input_root['labels'][:])
+    root.attrs['original_shape'] = d_masks.shape[1:]
+    root.attrs['kwargs'] = kwargs
+    
+    logging.info('Feature calc: finished.')
+
+
+def _OLD_features_from_dataset_zarr(
     features_from_mask: Callable,
     masks_zarr_path: str,
     output_zarr_path: str,

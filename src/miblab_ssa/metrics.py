@@ -150,13 +150,13 @@ def _hausdorff_matrix_chunk(M, pairs):
         chunk[(i, j)] = haus_ij
     return chunk
 
+
 def dice_matrix_zarr(zarr_path):
-    # 1. Load with specific chunks: 1 sample per chunk, full spatial info
-    # This is the 'Tall-Skinny' orientation
+    # Load with your original 1-sample chunks
     d_masks = da.from_zarr(zarr_path, component='masks')
-    
-    # Flattening (N, 301, 301, 301) -> (N, 27270901)
-    d_masks_flat = d_masks.astype(np.int32).reshape(d_masks.shape[0], -1)
+
+    # Now flatten
+    d_masks_flat = d_masks.astype(np.float32).reshape(d_masks.shape[0], -1)
 
     # 2. Perform the Dot Product Lazily
     # Dask will only compute pieces of this matrix as needed
@@ -194,6 +194,7 @@ def hausdorff_matrix_zarr(zarr_path: str):
     ]
 
     # 3. Compute
+    logging.info(f"Hausdorff matrix: Computing {n} row tasks...")
     with ProgressBar():
         rows = dask.compute(*tasks)
 
