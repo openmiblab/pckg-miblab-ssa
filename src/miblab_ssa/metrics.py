@@ -5,11 +5,7 @@ from scipy.spatial import cKDTree
 import dask
 from dask.diagnostics import ProgressBar
 import dask.array as da
-import psutil
 import zarr
-import numpy as np
-import logging
-from multiprocessing import Pool
 from tqdm import tqdm
 
 
@@ -70,10 +66,7 @@ def surface_distances(vol_a, vol_b, spacing=(1.0,1.0,1.0)):
 
 
 
-import numpy as np
-import dask
-import logging
-from dask.diagnostics import ProgressBar
+
 
 def load_mask_npz(path, key):
     """Simple loader for a single NPZ file."""
@@ -210,7 +203,7 @@ def dice_matrix_zarr(zarr_path, block_size=100):
     
     # We process 100 rows at a time. 
     # This keeps the Dask Task Graph small and manageable for the Scheduler.
-    for i in range(0, n_samples, block_size):
+    for i in tqdm(range(0, n_samples, block_size)):
         end_i = min(i + block_size, n_samples)
         
         # This dot product is (Block, Voxels) @ (Voxels, N)
@@ -272,5 +265,7 @@ def _compute_hausdorff_row(zarr_path, i, n):
         mask_j = z_masks[j].astype(bool)
         h_val, _ = surface_distances(mask_i, mask_j)
         row_results[idx] = h_val
+
+    logging.info(f"Hausdorff matrix: finished computing row {i} of {n}.")
         
     return row_results
