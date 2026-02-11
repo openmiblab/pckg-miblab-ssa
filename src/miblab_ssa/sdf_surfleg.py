@@ -3,6 +3,7 @@ import gc
 from itertools import product
 from scipy.ndimage import distance_transform_edt
 from numpy.polynomial.legendre import legvander
+from scipy.ndimage import label, center_of_mass
 
 def features_from_mask(mask, order=15, n_samples=60000, random_seed=42):
     """
@@ -79,7 +80,7 @@ def features_from_mask(mask, order=15, n_samples=60000, random_seed=42):
     return coeffs.astype(np.float32)
 
 
-from scipy.ndimage import label, center_of_mass
+
 
 def mask_from_features(coeffs, shape, order):
     """

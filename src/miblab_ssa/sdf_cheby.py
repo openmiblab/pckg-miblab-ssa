@@ -68,142 +68,78 @@ def spectral_vectors(order):
     return np.array(degrees).T.astype(np.int32)
 
 
-# def features_from_mask(mask, order=15, n_samples=50000, random_seed=42):
-#     """
-#     Extracts PCA-ready shape coefficients using a fixed coordinate system 
-#     based on the mask volume dimensions.
-#     """
-#     # Fix the seed so the random sampling is identical every time
-#     np.random.seed(random_seed)
-
-#     # 1. Define Fixed Coordinate System (Middle of the Cube)
-#     # Since your data is registered, we use the volume's geometrical center.
-#     nz, ny, nx = mask.shape
-#     center = np.array([nz, ny, nx]) / 2.0
-    
-#     # Scale covers the entire volume (radius from center to edge)
-#     # For a cube of size N, radius is N/2. 
-#     scale = np.max([nz, ny, nx]) / 2.0
-
-#     # 2. Compute SDF
-#     dist_outside = distance_transform_edt(1 - mask)
-#     dist_inside = distance_transform_edt(mask)
-#     sdf = dist_outside - dist_inside
-    
-#     # 3. Robust Sampling Strategy
-#     boundary_mask = np.abs(sdf) < 3.0
-#     idx_boundary = np.argwhere(boundary_mask)
-    
-#     # Generate random indices globally
-#     idx_random = np.random.randint(0, [nz, ny, nx], size=(n_samples, 3))
-    
-#     # Combine (50% boundary, 50% random air)
-#     n_bound = int(n_samples * 0.5)
-#     if len(idx_boundary) > 0:
-#         idx_b_select = idx_boundary[np.random.choice(len(idx_boundary), n_bound, replace=True)]
-#     else:
-#         idx_b_select = idx_boundary # Fallback
-
-#     indices = np.vstack([idx_b_select, idx_random])
-    
-#     z_idx, y_idx, x_idx = indices[:, 0], indices[:, 1], indices[:, 2]
-#     Values = sdf[z_idx, y_idx, x_idx]
-    
-#     # 4. Normalize Coords to [-1, 1] using Fixed Center/Scale
-#     Z = (z_idx - center[0]) / scale
-#     Y = (y_idx - center[1]) / scale
-#     X = (x_idx - center[2]) / scale
-    
-#     # Filter valid cube (points outside the fitting domain must be ignored)
-#     valid_mask = (np.abs(X) <= 1) & (np.abs(Y) <= 1) & (np.abs(Z) <= 1)
-    
-#     X, Y, Z = X[valid_mask], Y[valid_mask], Z[valid_mask]
-#     Values = Values[valid_mask]
-    
-#     # 5. Generate Basis
-#     Tx = chebvander(X, order)
-#     Ty = chebvander(Y, order)
-#     Tz = chebvander(Z, order)
-    
-#     basis_cols = []
-#     # Deterministic loop order for PCA consistency
-#     for i, j, k in product(range(order + 1), repeat=3):
-#         if i + j + k <= order:
-#             col = Tx[:, i] * Ty[:, j] * Tz[:, k]
-#             basis_cols.append(col)
-            
-#     A = np.column_stack(basis_cols)
-    
-#     # 6. Solve
-#     clf = Ridge(alpha=1e-3, fit_intercept=False)
-#     clf.fit(A, Values)
-    
-#     return clf.coef_.astype(np.float32)
-
-def features_from_mask(mask, order=32, n_samples=50000, random_seed=42):
-    """Memory usage: samples x coeffs x 4 x 2 + 500MB"""
+def features_from_mask(mask, order=15, n_samples=50000, random_seed=42):
+    """
+    Extracts PCA-ready shape coefficients using a fixed coordinate system 
+    based on the mask volume dimensions.
+    """
+    # Fix the seed so the random sampling is identical every time
     np.random.seed(random_seed)
 
-    # 1. Coordinate Setup
+    # 1. Define Fixed Coordinate System (Middle of the Cube)
+    # Since your data is registered, we use the volume's geometrical center.
     nz, ny, nx = mask.shape
     center = np.array([nz, ny, nx]) / 2.0
+    
+    # Scale covers the entire volume (radius from center to edge)
+    # For a cube of size N, radius is N/2. 
     scale = np.max([nz, ny, nx]) / 2.0
 
-    # 2. Compute SDF (Peak RAM: ~320MB)
-    sdf = distance_transform_edt(1 - mask) - distance_transform_edt(mask)
+    # 2. Compute SDF
+    dist_outside = distance_transform_edt(1 - mask)
+    dist_inside = distance_transform_edt(mask)
+    sdf = dist_outside - dist_inside
     
-    # 3. Sampling
+    # 3. Robust Sampling Strategy
     boundary_mask = np.abs(sdf) < 3.0
     idx_boundary = np.argwhere(boundary_mask)
+    
+    # Generate random indices globally
     idx_random = np.random.randint(0, [nz, ny, nx], size=(n_samples, 3))
     
+    # Combine (50% boundary, 50% random air)
     n_bound = int(n_samples * 0.5)
-    idx_b_select = idx_boundary[np.random.choice(len(idx_boundary), n_bound, replace=True)]
+    if len(idx_boundary) > 0:
+        idx_b_select = idx_boundary[np.random.choice(len(idx_boundary), n_bound, replace=True)]
+    else:
+        idx_b_select = idx_boundary # Fallback
+
     indices = np.vstack([idx_b_select, idx_random])
     
-    # Extract Values and clean up large 3D arrays immediately
-    Values = sdf[indices[:, 0], indices[:, 1], indices[:, 2]].astype(np.float32)
+    z_idx, y_idx, x_idx = indices[:, 0], indices[:, 1], indices[:, 2]
+    Values = sdf[z_idx, y_idx, x_idx]
     
-    # --- CRITICAL: RELEASE 3D MEMORY ---
-    # We no longer need the 27M-voxel grids.
-    del sdf, boundary_mask, idx_boundary, idx_random
+    # 4. Normalize Coords to [-1, 1] using Fixed Center/Scale
+    Z = (z_idx - center[0]) / scale
+    Y = (y_idx - center[1]) / scale
+    X = (x_idx - center[2]) / scale
     
-    # 4. Normalize Coords
-    Z = (indices[:, 0] - center[0]) / scale
-    Y = (indices[:, 1] - center[1]) / scale
-    X = (indices[:, 2] - center[2]) / scale
+    # Filter valid cube (points outside the fitting domain must be ignored)
     valid_mask = (np.abs(X) <= 1) & (np.abs(Y) <= 1) & (np.abs(Z) <= 1)
     
-    X, Y, Z = X[valid_mask].astype(np.float32), Y[valid_mask].astype(np.float32), Z[valid_mask].astype(np.float32)
+    X, Y, Z = X[valid_mask], Y[valid_mask], Z[valid_mask]
     Values = Values[valid_mask]
-
-    # 5. Optimized Basis Generation
-    Tx = chebvander(X, order).astype(np.float32)
-    Ty = chebvander(Y, order).astype(np.float32)
-    Tz = chebvander(Z, order).astype(np.float32)
-
-    # Pre-calculate coefficient count for Order 32 (6,545)
-    n_coeffs = (order + 1) * (order + 2) * (order + 3) // 6
     
-    # Pre-allocate Matrix A in float32 (1.3 GB vs 2.6 GB)
-    A = np.empty((len(X), n_coeffs), dtype=np.float32)
+    # 5. Generate Basis
+    Tx = chebvander(X, order)
+    Ty = chebvander(Y, order)
+    Tz = chebvander(Z, order)
     
-    curr = 0
-    # Fill A directly to avoid column_stack memory spikes
-    for i in range(order + 1):
-        for j in range(order + 1 - i):
-            for k in range(order + 1 - i - j):
-                # In-place multiplication into the pre-allocated slice
-                # 
-                np.multiply(Tx[:, i] * Ty[:, j], Tz[:, k], out=A[:, curr])
-                curr += 1
-
-    # 6. Solve with Ridge (Peak RAM: ~2.6GB)
-    # Using float32 ensures the solver's internal copies are half-size
+    basis_cols = []
+    # Deterministic loop order for PCA consistency
+    for i, j, k in product(range(order + 1), repeat=3):
+        if i + j + k <= order:
+            col = Tx[:, i] * Ty[:, j] * Tz[:, k]
+            basis_cols.append(col)
+            
+    A = np.column_stack(basis_cols)
+    
+    # 6. Solve
     clf = Ridge(alpha=1e-3, fit_intercept=False)
     clf.fit(A, Values)
     
     return clf.coef_.astype(np.float32)
+
 
 def mask_from_features(coeffs, shape, order):
     """
