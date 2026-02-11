@@ -141,72 +141,152 @@ def modes_from_pca_npz(
 # ZARRAYS
 
 
+
 def features_from_dataset_zarr(
     features_from_mask: Callable,
     masks_zarr_path: str,
     output_zarr_path: str,
-    **kwargs,
-    
+    **kwargs
 ):
-    """Max memory usage: (1 mask + 1 feature vector) x overhea dof features_from_mask"""
-    logging.info(f"Feature calc: connecting to {os.path.basename(masks_zarr_path)}..")
-    
-    # 1. Input: Lazy connection to masks
-    d_masks = da.from_zarr(masks_zarr_path, component='masks')
-    n_samples = d_masks.shape[0]
-
-    # 2. Metadata Shape Probe (Run once to get feature dimensions)
-    # We compute just the first mask to see what the feature vector looks like
-    sample_mask = d_masks[0].compute() 
-    sample_feature = features_from_mask(sample_mask, **kwargs)
-    n_features = sample_feature.shape[0]
-    dtype = sample_feature.dtype
-    
-    logging.info(f"Feature vector shape: ({n_features},). Chunks: (1, {n_features})")
-
-    # 3. Construction: Build a simple Task Graph
-    # We treat every single mask as an independent task
-    delayed_func = dask.delayed(features_from_mask)
-    lazy_rows = []
-    
-    for i in range(n_samples):
-        # delayed task handles one volume at a time
-        task = delayed_func(d_masks[i], **kwargs)
-        # from_delayed turns that task into a dask 'block'
-        d_row = da.from_delayed(task, shape=(n_features,), dtype=dtype)
-        lazy_rows.append(d_row) 
-
-    # Stack them into a matrix and ensure the chunking is (1, n_features)
-    d_feature_matrix = da.stack(lazy_rows).rechunk({0: 1, 1: -1})
-
-    # 4. Storage Preparation
-    if not output_zarr_path.endswith('.zarr'):
-        output_zarr_path += '.zarr'
-        
-    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
-
-    # 5. Execution: Stream to Disk
-    logging.info(f"Streaming {n_samples} feature vectors to {output_zarr_path}...")
-    with ProgressBar():
-        # Because chunks=(1, n_features), Dask writes one small file per sample.
-        # This is extremely resilient on HPC.
-        d_feature_matrix.to_zarr(
-            output_zarr_path, 
-            component='features', 
-            overwrite=True,
-            compressor=compressor
-        )    
-
-    # 6. Metadata Transfer
+    # 1. Open Input and Probe Shape
     input_root = zarr.open(masks_zarr_path, mode='r')
-    output_root = zarr.open(output_zarr_path, mode='a')
-    output_root.array('labels', input_root['labels'][:])
-    output_root.attrs['original_shape'] = d_masks.shape[1:]
+    n_samples = input_root['masks'].shape[0]
+    
+    # Run one probe to get n_features (Order 32 -> 6545)
+    sample_mask = input_root['masks'][0]
+    sample_feat = features_from_mask(sample_mask, **kwargs)
+    n_features = sample_feat.shape[0]
+    dtype = sample_feat.dtype
+    
+    # 2. Pre-allocate Output Zarr on Disk
+    # chunks=(1, n_features) means each row is an independent file on disk
+    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
+    output_root = zarr.open(output_zarr_path, mode='w')
+    z_features = output_root.create_dataset(
+        'features', 
+        shape=(n_samples, n_features), 
+        chunks=(1, n_features), 
+        dtype=dtype, 
+        compressor=compressor,
+        overwrite=True
+    )
+    
+    # 3. Define the Atomic "Read-Compute-Write" Task
+    @dask.delayed
+    def process_and_write(idx):
+        # WORKER-SIDE: Open input
+        in_store = zarr.open(masks_zarr_path, mode='r')
+        mask = in_store['masks'][idx]
+        
+        # Compute
+        feat = features_from_mask(mask, **kwargs)
+        
+        # WORKER-SIDE: Open output and write to specific slice
+        # Zarr handles concurrent writes to DIFFERENT chunks safely
+        out_store = zarr.open(output_zarr_path, mode='a')
+        out_store['features'][idx] = feat.astype(dtype)
+        
+        return True # Signal success
+
+    # 4. Create Task List
+    tasks = [process_and_write(i) for i in range(n_samples)]
+
+    # 5. Execute
+    logging.info(f"Computing {n_samples} samples with direct-to-disk writing...")
+    with ProgressBar():
+        dask.compute(*tasks)
+
+    # 6. Copy Metadata
+    output_root.create_dataset('labels', data=input_root['labels'][:])
+    output_root.attrs['original_shape'] = input_root['masks'].shape[1:]
     output_root.attrs['kwargs'] = kwargs
     
-    logging.info('Feature calc: finished.')
+    logging.info("Feature calculation complete.")
 
 
+
+
+def direct_pca_from_features_zarr(
+    features_zarr_path: str, 
+    output_zarr_path: str, 
+    n_components=50,
+    chunk_size=10000  # Number of features per chunk
+):
+    """
+    Direct SVD implementation to bypass dask_ml shuffle overhead.
+    Optimized for Wide Data (N_samples << N_features).
+    """
+    logging.info(f"PCA: Connecting to {os.path.basename(features_zarr_path)}...")
+
+    # 1. Open Zarr safely
+    feat_root = zarr.open(features_zarr_path, mode='r')
+    features_ds = feat_root['features']
+    labels = feat_root['labels'][:]
+    
+    # Rechunking: All samples (-1) for a slice of features.
+    # This is the "Tall and Skinny" slice that dask.linalg.svd prefers.
+    data = da.from_zarr(features_ds).rechunk({0: -1, 1: chunk_size})
+    n_samples, n_features = data.shape
+    k = n_components or 50
+
+    # 2. Manual Centering & Variance calculation
+    # We compute the mean and total variance first to calculate ratios later
+    logging.info("PCA: Computing column means and total variance...")
+    mean_dask = data.mean(axis=0)
+    
+    # We need the sum of individual feature variances for the ratio denominator
+    # We use a map_blocks approach or standard var to keep it lazy
+    total_var_dask = data.var(axis=0).sum()
+    
+    # Trigger compute for these small scalars/vectors
+    mean_np, total_var = da.compute(mean_dask, total_var_dask)
+    
+    # 3. Running Compressed SVD
+    logging.info(f"PCA: Running svd_compressed (k={k}) on {n_samples}x{n_features}...")
+    # data_centered is a lazy operation
+    data_centered = data - mean_np
+    
+    # u: Scores, s: Singular values, v: Components (Principal Axes)
+    u, s, v = da.linalg.svd_compressed(data_centered, k=k, n_power_iter=3)
+
+    # 4. Prepare Output Zarr
+    if not output_zarr_path.endswith('.zarr'):
+        output_zarr_path += '.zarr'
+    
+    store = zarr.DirectoryStore(output_zarr_path)
+    root = zarr.group(store=store, overwrite=True)
+    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
+
+    # 5. Compute and Save Results
+    # We compute s (singular values) first to derive variance metrics
+    s_np = s.compute()
+    
+    # Eigenvalues (Explained Variance) = s^2 / (n-1)
+    explained_variance = (s_np**2) / (n_samples - 1)
+    explained_variance_ratio = explained_variance / total_var
+
+    logging.info("PCA: Saving components (streaming dask -> zarr)...")
+    # Stream the massive V matrix (components) directly to disk
+    v.astype(np.float32).to_zarr(
+        url=root.store, 
+        component='components', 
+        compressor=compressor,
+        overwrite=True
+    )
+
+    logging.info("PCA: Saving metadata and variance metrics...")
+    root.create_dataset('mean', data=mean_np.astype(np.float32), compressor=compressor)
+    root.create_dataset('variance', data=explained_variance.astype(np.float32))
+    root.create_dataset('variance_ratio', data=explained_variance_ratio.astype(np.float32))
+    root.create_dataset('labels', data=labels)
+
+    # 6. Transfer Attributes
+    root.attrs['original_shape'] = feat_root.attrs.get('original_shape', None)
+    root.attrs['kwargs'] = feat_root.attrs.get('kwargs')
+    root.attrs['n_samples'] = n_samples
+    root.attrs['n_features'] = n_features
+
+    logging.info(f"PCA: Finished successfully.")
 
 def pca_from_features_zarr(
     features_zarr_path: str, 
@@ -238,7 +318,7 @@ def pca_from_features_zarr(
     # 2. Fit Dask PCA
     # svd_solver='full' is efficient when one dimension is significantly smaller
     logging.info(f"PCA: Fitting Dask PCA on {n_samples}x{n_features} matrix...")
-    pca = daskPCA(n_components=n_components, svd_solver='full')
+    pca = daskPCA(n_components=n_components, svd_solver='full') 
     pca.fit(data)
 
     # 3. Prepare Output Zarr
@@ -293,7 +373,6 @@ def pca_from_features_zarr(
     root.attrs['kwargs'] = feat_root.attrs.get('kwargs')
 
     logging.info(f"PCA: Finished.")
-    return pca.explained_variance_ratio_
 
 
 
