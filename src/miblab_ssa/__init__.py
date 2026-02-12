@@ -22,7 +22,10 @@ from .data import (
 from .pca_plot import (
     plot_pca_performance,
 )
-# from .pca_dl import (
-#     deep_pca_from_features_zarr,
-# )
+from .pca_dl import (
+    deep_pca_from_features_zarr,
+    deep_scores_from_features_zarr,
+    deep_masks_from_scores_zarr,
+    deep_modes_from_pca_zarr,
+)
 from . import sdf_spline, sdf_surfleg, sdf_ft, sdf_cheby, sdf_wvlt, lb, zernike, utils, sdf_rbf, sdf_legendre, sdf_zernike, pdm

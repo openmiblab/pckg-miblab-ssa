@@ -3,9 +3,14 @@ import torch.nn as nn
 import zarr
 import numpy as np
 import dask.array as da
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import Dataset, DataLoader
 import logging
 from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+
+
 
 class OrderedAutoencoder(nn.Module):
     def __init__(self, input_dim, latent_dim):
@@ -37,110 +42,134 @@ class OrderedAutoencoder(nn.Module):
             z = z * mask
         
         return self.decoder(z), z
+    
+class LinearOrderedAutoencoder(nn.Module):
+    def __init__(self, input_dim, latent_dim):
+        super().__init__()
+        self.latent_dim = latent_dim
+        
+        # Simple Linear Encoder
+        self.encoder = nn.Linear(input_dim, latent_dim)
+        
+        # Simple Linear Decoder (Mirrors the Encoder)
+        self.decoder = nn.Linear(latent_dim, input_dim)
 
+    def forward(self, x, mask_dim=None):
+        # 1. Encode to latent space (Scores)
+        z = self.encoder(x)
+        
+        # 2. Apply Nested Dropout (Ordering mechanism)
+        if self.training and mask_dim is not None:
+            # Create a mask that zeros out all components after index 'mask_dim'
+            mask = torch.zeros_like(z)
+            mask[:, :mask_dim] = 1.0
+            z = z * mask
+        
+        # 3. Decode back to feature space
+        recon = self.decoder(z)
+        
+        return recon, z
+
+class ZarrStreamingDataset(Dataset):
+    def __init__(self, zarr_path):
+        self.root = zarr.open(zarr_path, mode='r')
+        self.data = self.root['features']
+        # For simplicity, we assume pre-calculated stats or calculate once lazily
+        # Loading just the mean/std vectors (5000 elements) is very cheap
+        self.mean = np.mean(self.data, axis=0).astype(np.float32)
+        self.std = np.std(self.data, axis=0).astype(np.float32) + 1e-6
+
+    def __len__(self):
+        return self.data.shape[0]
+
+    def __getitem__(self, idx):
+        # Accesses disk, not RAM
+        sample = self.data[idx].astype(np.float32)
+        normalized = (sample - self.mean) / self.std
+        return torch.from_numpy(normalized)
 
 def deep_pca_from_features_zarr(
-    features_zarr_path: str, 
-    output_zarr_path: str,
-    model_save_path: str,
-    n_components=10, 
-    epochs=100,
-    batch_size=64
+    features_zarr_path, output_zarr_path, model_save_path,
+    n_components=25, epochs=100, batch_size=64
 ):
-    # 1. Load and Preprocess Data
-    logging.info(f"Loading features from {features_zarr_path}...")
-    feat_root = zarr.open(features_zarr_path, mode='r')
-    data_np = feat_root['features'][:].astype(np.float32)
-    
-    # Standardize Features (Crucial for Neural Networks)
-    train_mean = np.mean(data_np, axis=0)
-    train_std = np.std(data_np, axis=0) + 1e-6
-    data_normalized = (data_np - train_mean) / train_std
-    
-    data_tensor = torch.from_numpy(data_normalized).float()
-    n_samples, n_features = data_tensor.shape
-    
-    dataset = TensorDataset(data_tensor)
+    # 1. Setup Lazy Loading
+    logging.info(f"Connecting to {features_zarr_path}...")
+    dataset = ZarrStreamingDataset(features_zarr_path)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    n_samples = len(dataset)
+    n_features = dataset.data.shape[1]
 
     # 2. Initialize Model
-    model = OrderedAutoencoder(n_features, n_components)
+    model = LinearOrderedAutoencoder(n_features, n_components)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
 
-    # 3. Training Loop with Nested Dropout
-    logging.info(f"Starting training for {epochs} epochs...")
+    # 3. Training Loop
+    logging.info(f"Training for {epochs} epochs...")
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0
-        for batch in loader:
-            x = batch[0]
-            # Randomly select a sub-dimension to focus the 'energy' on early components
-            # This forces the network to make the first components the most important
+        for x in loader:
+            # Nested Dropout: Randomly truncate the latent bottleneck
             k = np.random.randint(1, n_components + 1)
-            
             recon, _ = model(x, mask_dim=k)
-            loss = criterion(recon, x)
             
+            loss = criterion(recon, x)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
         
         if (epoch + 1) % 10 == 0:
-            logging.info(f"Epoch {epoch+1}/{epochs} - Loss: {epoch_loss/len(loader):.6f}")
+            logging.info(f"Epoch {epoch+1} Loss: {epoch_loss/len(loader):.6f}")
 
-    # 4. Post-Training: Calculate Metrics and Latent Stats
+    # 4. Post-Training: Batch-processed Metrics
+    logging.info("Calculating scores and variance ratios...")
     model.eval()
+    all_scores = []
+    total_mse = [0.0] * n_components
+    
     with torch.no_grad():
-        # Get all scores (latent coordinates)
-        full_recon, scores = model(data_tensor)
-        
-        # Calculate Variance per component (for Normalization in scoring)
-        latent_std = torch.std(scores, dim=0).numpy()
-        
-        # Calculate Explained Variance equivalent
-        total_var = torch.var(data_tensor).item()
-        variances = []
-        for k in range(1, n_components + 1):
-            # Reconstruct using only top K components
-            mask = torch.zeros_like(scores)
-            mask[:, :k] = 1.0
-            z_limited = scores * mask
-            recon_k = model.decoder(z_limited)
+        # We pass through the data one last time in batches to avoid OOM
+        eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        for x in eval_loader:
+            full_recon, scores = model(x)
+            all_scores.append(scores)
             
-            mse_k = criterion(recon_k, data_tensor).item()
-            # Ratio of variance explained by the first k components
-            variances.append(1 - (mse_k / total_var))
+            # Calculate MSE for each k-cutoff to derive variance ratios
+            for k in range(1, n_components + 1):
+                mask = torch.zeros_like(scores)
+                mask[:, :k] = 1.0
+                recon_k = model.decoder(scores * mask)
+                total_mse[k-1] += nn.functional.mse_loss(recon_k, x, reduction='sum').item()
 
+    # Aggregate results
+    scores_final = torch.cat(all_scores, dim=0).numpy()
+    latent_std_np = np.std(scores_final, axis=0)
+    total_elements = n_samples * n_features
+    variances = [1 - (mse / total_elements) for mse in total_mse]
     exp_var_ratio = np.diff([0] + variances)
 
-    # 5. Save Model and Metadata (for Reconstruction/Scoring)
-    logging.info(f"Saving model to {model_save_path}...")
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'train_mean': train_mean,
-        'train_std': train_std,
-        'latent_std': latent_std,
-        'input_dim': n_features,
-        'latent_dim': n_components,
-        'original_shape': feat_root.attrs.get('original_shape'),
-        'kwargs': feat_root.attrs.get('kwargs')
-    }
-    torch.save(checkpoint, model_save_path)
-
-    # 6. Save Scores and Ratios to Zarr
+    # 5. Save results
+    logging.info(f"Saving to {output_zarr_path}...")
     store = zarr.DirectoryStore(output_zarr_path)
     root = zarr.group(store=store, overwrite=True)
+    root.create_dataset('scores', data=scores_final.astype(np.float32))
     root.create_dataset('variance_ratio', data=exp_var_ratio.astype(np.float32))
-    root.create_dataset('scores', data=scores.numpy().astype(np.float32))
-    root.create_dataset('labels', data=feat_root['labels'][:])
+    root.create_dataset('labels', data=dataset.root['labels'][:])
     
-    # Transfer attributes
-    root.attrs.update(feat_root.attrs)
-
-    logging.info("Deep PCA Training Complete.")
-    return exp_var_ratio
+    # Save Model Checkpoint
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'train_mean': dataset.mean,
+        'train_std': dataset.std,
+        'latent_std': latent_std_np,  
+        'input_dim': n_features,
+        'latent_dim': n_components
+    }
+    torch.save(checkpoint, model_save_path)
+    
 
 
 
@@ -319,7 +348,7 @@ def deep_modes_from_pca_zarr(
     modes_zarr_path: str, 
     n_components=8, 
     n_coeffs=11, 
-    max_coeff=3  # Typically 2 or 3 standard deviations
+    max_coeff=10  # Typically 2 or 3 standard deviations
 ):
     """
     Generates 3D shape modes by traversing the latent space of the Autoencoder.
