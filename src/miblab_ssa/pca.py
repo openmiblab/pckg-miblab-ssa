@@ -3,115 +3,16 @@ from typing import Callable, Tuple, List, Dict, Any
 import numpy as np
 from sklearn.decomposition import PCA
 import logging
-import dask
-from dask.diagnostics import ProgressBar
-from itertools import product
 from tqdm import tqdm
 import zarr
 import dask.array as da
-import dask.delayed
 import pandas as pd
 from dask_ml.decomposition import PCA as daskPCA
 
-from miblab_ssa.metrics import dice_coefficient
 
 
 
-def pca_from_features_npz(feature_file, pca_file):
-    """
-    Fits PCA and saves results while preserving all original metadata.
-    """
-    with np.load(feature_file) as data:
-        features = data['features']
-        original_shape = data['original_shape']
-        labels = data['labels']
-        kwargs = data['kwargs']
-
-    # Fit the PCA
-    pca = PCA()
-    pca.fit(features)
-
-    # This saves the original metadata + the new PCA keys
-    np.savez(pca_file, 
-        mean = pca.mean_,
-        components = pca.components_,
-        variance = pca.explained_variance_,
-        variance_ratio = pca.explained_variance_ratio_, 
-        original_shape = original_shape,
-        labels = labels,
-        kwargs = kwargs,    
-    )
-
-    return pca.explained_variance_ratio_
-
-
-def coefficients_from_features_npz(feature_file, pca_file, coeffs_file):
-
-    # Load the features
-    with np.load(feature_file) as data:
-        features = data['features'] # (n_samples, n_features)
-        labels = data['labels']
-
-    # Load the PCA matrices
-    # 1. Load the matrices
-    with np.load(pca_file) as data:
-        mean_vec = data['mean']        # Shape: (n_features,)
-        components = data['components'] # Shape: (n_components, n_features)
-        variance = data['variance']    # Shape: (n_components,)
-
-    # 1. Center the data
-    # Broadcasting handles (N, F) - (F,) automatically
-    centered_features = features - mean_vec
-
-    # 2. Projection (The "Transform" step)
-    # Matrix Multiplication: (N, F) @ (F, K) -> (N, K)
-    scores = centered_features @ components.T
-
-    # 3. Calculate Sigma (Z-Score)
-    # Broadcasting handles (N, K) / (K,) automatically
-    coeffs = scores / np.sqrt(variance)
-
-    np.savez(coeffs_file, coeffs=coeffs, labels=labels)
-
-
-def modes_from_pca_npz(
-    mask_from_features: Callable,
-    pca_file, 
-    modes_file, 
-    n_components=8, 
-    n_coeffs=11, 
-    max_coeff=2,
-):
-    # coeffs is list of coefficient vectors
-    # Each coefficient vector has dimensionless coefficients in the components
-    # x_i = mean + α_i * sqrt(variance_i) * component_i
-    coeffs = np.linspace(-max_coeff, max_coeff, n_coeffs)
-
-    with np.load(pca_file) as data:
-        var = data['variance']
-        avr = data['mean']
-        comps = data['components']
-        original_shape = data['original_shape']
-        kwargs = data['kwargs']
-
-    sdev = np.sqrt(var)    # Shape: (n_components,)
-    mask_shape = (n_coeffs, n_components) + tuple(original_shape)
-    masks = np.empty(mask_shape, dtype=bool)
-
-    n_iter = n_coeffs * n_components
-    iterator = product(range(n_coeffs), range(n_components))
-    for j, i in tqdm(iterator, total=n_iter, desc='Computing modes from PCA'):
-        feat = avr + coeffs[j] * sdev[i] * comps[i,:]
-        masks[j,i,...] = mask_from_features(feat, original_shape, **kwargs)
-
-    np.savez(modes_file, masks=masks, coeffs=coeffs)
-
-
-# ZARRAYS
-
-
-
-def pca_from_features_zarr(
+def pca_from_features(
     features_zarr_path: str, 
     output_zarr_path: str, 
     n_components=None
@@ -171,7 +72,7 @@ def pca_from_features_zarr(
     logging.info("PCA: Finished.")
 
 
-def direct_pca_from_features_zarr(
+def direct_pca_from_features(
     features_zarr_path: str, 
     output_zarr_path: str, 
     n_components=50,
@@ -254,7 +155,7 @@ def direct_pca_from_features_zarr(
     logging.info(f"PCA: Finished successfully.")
 
 
-def dask_pca_from_features_zarr(
+def dask_pca_from_features(
     features_zarr_path: str, 
     output_zarr_path: str, 
     n_components=None,
@@ -342,7 +243,7 @@ def dask_pca_from_features_zarr(
 
 
 
-def scores_from_features_zarr(
+def scores_from_features(
     features_zarr_path, 
     pca_zarr_path, 
     output_zarr_path
@@ -407,7 +308,7 @@ def scores_from_features_zarr(
     return scores, normalized_scores
 
 
-def dask_scores_from_features_zarr(
+def dask_scores_from_features(
     features_zarr_path, 
     pca_zarr_path, 
     output_zarr_path, 
@@ -485,7 +386,7 @@ def dask_scores_from_features_zarr(
     return True
 
 
-def modes_from_pca_zarr(
+def modes_from_pca(
     pca_zarr_path: str, 
     modes_zarr_path: str, 
     n_components=8, 
@@ -549,7 +450,7 @@ def modes_from_pca_zarr(
 
 
 
-def features_from_scores_zarr(
+def features_from_scores(
     pca_zarr_path, 
     scores_zarr_path,
     output_zarr_path,
@@ -610,7 +511,7 @@ def features_from_scores_zarr(
     logging.info("Reconstruction finished.")
 
 
-def cumulative_features_from_scores_zarr(
+def cumulative_features_from_scores(
     pca_zarr_path: str, 
     scores_zarr_path: str,
     output_zarr_path: str,

@@ -8,7 +8,7 @@ import numpy as np
 
 
 
-def features_from_dataset_zarr(
+def features_from_dataset(
     features_from_mask: Callable,
     masks_zarr_path: str,
     output_zarr_path: str,
@@ -38,7 +38,7 @@ def features_from_dataset_zarr(
     )
     
     # 3. Define the Atomic "Read-Compute-Write" Task
-    @dask.delayed
+    #@dask.delayed
     def process_and_write(idx):
         # WORKER-SIDE: Open input
         in_store = zarr.open(masks_zarr_path, mode='r')
@@ -56,11 +56,9 @@ def features_from_dataset_zarr(
         logging.info(f"Finished computing features for sample {idx+1}")
     
     # 4. Create Task List
-    tasks = [process_and_write(i) for i in range(n_samples)]
-
-    # 5. Execute
     logging.info(f"Computing {n_samples} samples with direct-to-disk writing...")
-    dask.compute(*tasks)
+    tasks = [process_and_write(i) for i in range(n_samples)]
+    #dask.compute(*tasks)
 
     # 6. Copy Metadata
     output_root.create_dataset('labels', data=input_root['labels'][:])
@@ -72,7 +70,7 @@ def features_from_dataset_zarr(
 
 
 
-def dataset_from_features_zarr(
+def dataset_from_features(
     mask_from_features: Callable,
     features_zarr_path: str,
     output_zarr_path: str,
@@ -112,7 +110,7 @@ def dataset_from_features_zarr(
     )
 
     # --- 4. Parallel Reconstruction ---
-    @dask.delayed
+    #@dask.delayed
     def reconstruct_and_write(flat_idx):
         multi_idx = np.unravel_index(flat_idx, leading_shape)
         
@@ -126,8 +124,8 @@ def dataset_from_features_zarr(
         out_store['masks'][multi_idx] = mask.astype(bool)
         return True
 
-    tasks = [reconstruct_and_write(i) for i in range(n_total_tasks)]
     logging.info(f"Reconstructing {n_total_tasks} masks...")
-    dask.compute(*tasks)
+    tasks = [reconstruct_and_write(i) for i in range(n_total_tasks)]
+    #dask.compute(*tasks)
     
     return True

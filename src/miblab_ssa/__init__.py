@@ -2,26 +2,26 @@ from .normalize import (
     normalize_kidney_mask
 )
 from .features import (
-    features_from_dataset_zarr,
-    dataset_from_features_zarr,
+    features_from_dataset,
+    dataset_from_features,
 )
 from .pca import (
-    pca_from_features_zarr,
-    dask_pca_from_features_zarr,
-    direct_pca_from_features_zarr,
-    pca_from_features_zarr, 
-    scores_from_features_zarr,
-    dask_scores_from_features_zarr,
-    modes_from_pca_zarr,
+    pca_from_features,
+    dask_pca_from_features,
+    direct_pca_from_features,
+    pca_from_features, 
+    scores_from_features,
+    dask_scores_from_features,
+    modes_from_pca,
     pca_performance,
-    features_from_scores_zarr,
-    cumulative_features_from_scores_zarr
+    features_from_scores,
+    cumulative_features_from_scores
 )
 from .metrics import (
     dice_coefficient,
     surface_distances,
-    hausdorff_matrix_zarr,
-    dice_matrix_zarr
+    hausdorff_matrix,
+    dice_matrix
 )
 from .data import (
     save_masks_as_zarr,
@@ -31,10 +31,10 @@ from .pca_plot import (
     plot_pca_performance,
 )
 # from .pca_dl import (
-#     deep_pca_from_features_zarr,
-#     deep_scores_from_features_zarr,
-#     deep_masks_from_scores_zarr,
-#     deep_modes_from_pca_zarr,
+#     deep_pca_from_features,
+#     deep_scores_from_features,
+#     deep_masks_from_scores,
+#     deep_modes_from_pca,
 # )
 from . import (
     sdf_spline, 
