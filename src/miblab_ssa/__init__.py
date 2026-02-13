@@ -3,7 +3,9 @@ from .normalize import (
 )
 from .features import (
     features_from_dataset,
+    features_from_dataset_sequential,
     dataset_from_features,
+    dataset_from_features_sequential,
 )
 from .pca import (
     pca_from_features,
