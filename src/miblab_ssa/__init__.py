@@ -36,4 +36,17 @@ from .pca_plot import (
 #     deep_masks_from_scores_zarr,
 #     deep_modes_from_pca_zarr,
 # )
-from . import sdf_spline, sdf_ft, sdf_cheby, sdf_wvlt, lb, zernike, utils, sdf_rbf, sdf_legendre, sdf_zernike, pdm
+from . import (
+    sdf_spline, 
+    sdf_pspline,
+    sdf_ft, 
+    sdf_cheby, 
+    sdf_wvlt, 
+    lb, 
+    zernike, 
+    utils, 
+    sdf_rbf, 
+    sdf_legendre, 
+    sdf_zernike, 
+    pdm,
+)
