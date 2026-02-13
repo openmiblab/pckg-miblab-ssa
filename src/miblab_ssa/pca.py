@@ -554,7 +554,7 @@ def features_from_scores_zarr(
     scores_zarr_path,
     output_zarr_path,
     target_labels=None,
-    components=None,
+    n_components=None,
 ):
     z_pca = zarr.open(pca_zarr_path, mode='r')
     z_scores = zarr.open(scores_zarr_path, mode='r')
@@ -564,11 +564,10 @@ def features_from_scores_zarr(
     n_features = z_pca['components'].shape[1]
     
     # Optimization: Pre-load components once
-    if components is not None:
-        # Ensure components is a sorted list for better Zarr access
-        eig_vecs = z_pca['components'].get_basic_selection(np.sort(components))
+    if n_components is None:
+        eig_vecs = z_pca['components'][:]
     else:
-        eig_vecs = z_pca['components'][:] # Load all if they fit in RAM
+        eig_vecs = z_pca['components'][:n_components]
 
     # Label indexing
     all_labels = z_scores['labels'][:].astype(str)
@@ -594,16 +593,19 @@ def features_from_scores_zarr(
     # Map to fixed-length string or object to avoid Zarr string errors
     root.array('labels', data=found_labels)
 
-    eig_vecs = z_pca['components'][:]
     for i, idx in enumerate(valid_indices):
-        score = z_scores['scores'][idx]
         
-        if components is not None:
-            # Match scores to the loaded eigen_vectors
-            score = score[components]
+        if n_components is None:
+            score = z_scores['scores'][idx]
+        else:
+            score = z_scores['scores'][idx,:n_components]
             
         # Standard reconstruction: mean + (scores @ components)
         z_recons[i] = (avr + np.dot(score, eig_vecs)).astype(np.float32)
+
+    # Copy essential attributes for reconstruction
+    root.attrs['original_shape'] = z_scores.attrs.get('original_shape')
+    root.attrs['kwargs'] = z_scores.attrs.get('kwargs')
 
     logging.info("Reconstruction finished.")
 
@@ -699,7 +701,6 @@ def pca_performance(
     marginal_mse_path: str,
     cumulative_mse_path: str,
     n_components: int = 50,
-    overwrite: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     
     # 1. Open Zarr Stores
@@ -724,19 +725,6 @@ def pca_performance(
     marginal_mse = np.zeros((n_samples, n_components), dtype=np.float32)
     cumulative_mse = np.zeros((n_samples, n_components), dtype=np.float32)
 
-    if not overwrite and os.path.exists(cumulative_mse_path) and os.path.exists(marginal_mse_path):
-        logging.info("Resuming from existing MSE files...")
-        try:
-            marginal_mse = pd.read_csv(marginal_mse_path, index_col=0).values.astype(np.float32)
-            cumulative_mse = pd.read_csv(cumulative_mse_path, index_col=0).values.astype(np.float32)
-            # Ensure shape matches current n_components
-            if marginal_mse.shape[1] != n_components:
-                logging.warning("Saved file component count differs from n_components. Restarting.")
-                marginal_mse = np.zeros((n_samples, n_components), dtype=np.float32)
-                cumulative_mse = np.zeros((n_samples, n_components), dtype=np.float32)
-        except Exception as e:
-            logging.error(f"Could not load progress: {e}. Starting fresh.")
-
     # 4. Sequential Processing Loop
     logging.info(f"Starting PCA performance evaluation for {n_samples} subjects.")
     
@@ -744,11 +732,6 @@ def pca_performance(
         # --- Skip Logic ---
         if label not in orig_label_to_idx:
             logging.warning(f"Label {label} not found in original masks. Skipping.")
-            continue
-        
-        # Check if subject is already computed (all zeros in cumulative row)
-        # We check [i, -1] because the last component is the most likely to be filled last
-        if not overwrite and np.any(cumulative_mse[i, :]):
             continue
             
         # --- Computation ---
@@ -772,7 +755,6 @@ def pca_performance(
             cumulative_mse[i, k] = np.linalg.norm(current_cumulative_vec-orig_features)/orig_features_norm
         
         # 5. Save Progress per Subject
-        # Doing this per subject is a good balance between safety and performance
         pd.DataFrame(marginal_mse, index=labels_scores).to_csv(marginal_mse_path)
         pd.DataFrame(cumulative_mse, index=labels_scores).to_csv(cumulative_mse_path)
 
