@@ -7,83 +7,90 @@ import pandas as pd
 def plot_pca_performance(
     pca_zarr_path: str, 
     output_image_path: str,
-    marginal_dice_path: str = None, 
-    cumulative_dice_path: str = None, 
+    marginal_mse_path: str = None, 
+    cumulative_mse_path: str = None, 
     n_components: int = None
 ):
-    """
-    Visualizes PCA performance. 
-    Switches to scatter plots and dynamic row count based on Dice availability.
-    """
     # 1. Load Variance Data
     z_pca = zarr.open(pca_zarr_path, mode='r')
     var_ratio = z_pca['variance_ratio'][:] 
-    
-    # Apply n_components limit if provided
     limit = n_components if n_components else var_ratio.size
     var_ratio = var_ratio[:limit]
     cum_var_ratio = np.cumsum(var_ratio)
-    x = np.arange(1, len(var_ratio) + 1)
+    x_var = np.arange(1, len(var_ratio) + 1)
 
-    # 2. Determine Layout
-    # If no dice paths are provided, we only need 1 row
-    show_dice = marginal_dice_path is not None or cumulative_dice_path is not None
-    nrows = 2 if show_dice else 1
+    # 2. Determine Global Y-Max for MSE plots
+    global_mse_max = 0
+    mse_dfs = {}
     
-    fig, axes = plt.subplots(nrows, 2, figsize=(16, 5 * nrows), sharex=True, squeeze=False)
-    plt.subplots_adjust(hspace=0.3, wspace=0.2)
+    for path, key in zip([marginal_mse_path, cumulative_mse_path], ['marginal', 'cumulative']):
+        if path:
+            df = pd.read_csv(path, index_col=0)
+            if limit is not None:
+                # Assuming the first column is 'Average', limit + 1 columns are kept
+                df = df.iloc[:, :limit + 1] 
+            mse_dfs[key] = df
+            global_mse_max = max(global_mse_max, df.values.max())
 
-    # --- TOP ROW: Variance (Scatter) ---
-    axes[0, 0].scatter(x, var_ratio, color='steelblue', s=15, alpha=0.8)
+    # 3. Determine Layout
+    show_mse = len(mse_dfs) > 0
+    nrows = 2 if show_mse else 1
+    
+    fig, axes = plt.subplots(nrows, 2, figsize=(16, 5 * nrows), squeeze=False)
+    plt.subplots_adjust(hspace=0.4, wspace=0.2)
+
+    # --- TOP ROW: Variance ---
+    axes[0, 0].scatter(x_var, var_ratio, color='steelblue', s=15, alpha=0.8)
     axes[0, 0].set_title("Marginal Explained Variance", fontsize=14)
     axes[0, 0].set_ylabel("Variance Ratio")
+    axes[0, 0].set_ylim(0, None) # TWEAK: Start at zero
     axes[0, 0].grid(linestyle='--', alpha=0.5)
 
-    axes[0, 1].scatter(x, cum_var_ratio, color='firebrick', s=15, alpha=0.8)
+    axes[0, 1].scatter(x_var, cum_var_ratio, color='firebrick', s=15, alpha=0.8)
     axes[0, 1].set_title("Cumulative Explained Variance", fontsize=14)
     axes[0, 1].set_ylabel("Total Variance Ratio")
     axes[0, 1].set_ylim(0, 1.05)
     axes[0, 1].grid(linestyle='--', alpha=0.5)
 
-    # --- DICE PLOTTING HELPER ---
-    def plot_dice_distribution(ax, data_path, title):
-        df = pd.read_csv(data_path)
-        # Ensure we only plot up to the same n_components limit
-        df = df.iloc[:, :limit]
+    # --- MSE PLOTTING HELPER ---
+    def render_mse_plot(ax, df, title, y_limit):
+        x_steps = df.columns.astype(float)
         
-        # Calculate Stats
         median = df.median(axis=0)
         q1 = df.quantile(0.25, axis=0)
         q3 = df.quantile(0.75, axis=0)
         d_min = df.min(axis=0)
         d_max = df.max(axis=0)
         
-        # Scatter for Median
-        ax.scatter(x, median, color='indigo', s=20, label='Median Dice', zorder=3)
-        # Fill ranges to maintain context of population spread
-        ax.fill_between(x, d_min, d_max, color='gray', alpha=0.1, label='Min-Max')
-        ax.fill_between(x, q1, q3, color='mediumpurple', alpha=0.3, label='IQR')
+        # TWEAK: Darker Min-Max shading (alpha=0.2 instead of 0.1)
+        ax.fill_between(x_steps, d_min, d_max, color='gray', alpha=0.2, label='Min-Max Range')
+        ax.fill_between(x_steps, q1, q3, color='mediumpurple', alpha=0.4, label='Interquartile Range')
+        
+        ax.scatter(x_steps, median, color='indigo', s=25, label='Median MSE', zorder=3)
+        ax.plot(x_steps, median, color='indigo', alpha=0.7, linestyle='-', lw=1.5, zorder=4)
         
         ax.set_title(title, fontsize=14)
-        ax.set_ylabel("Dice Coefficient")
-        ax.set_xlabel("Principal Component Index")
-        ax.set_ylim(0, 1.0)
+        ax.set_ylabel("Mean Squared Error")
+        ax.set_xlabel("Principal Components")
+        
+        ax.set_ylim(0, y_limit * 1.1) # Unified scale with headroom
+        ax.set_xlim(0, limit)
+        
         ax.grid(linestyle='--', alpha=0.5)
-        ax.legend(loc='lower right', fontsize='small')
+        ax.legend(loc='best', fontsize='small')
 
-    # --- BOTTOM ROW: Dice (Optional) ---
-    if show_dice:
-        if marginal_dice_path:
-            plot_dice_distribution(axes[1, 0], marginal_dice_path, "Marginal Accuracy")
+    # --- BOTTOM ROW: MSE ---
+    if show_mse:
+        if 'marginal' in mse_dfs:
+            render_mse_plot(axes[1, 0], mse_dfs['marginal'], "Marginal Reconstruction Error", global_mse_max)
         else:
             axes[1, 0].set_axis_off()
 
-        if cumulative_dice_path:
-            plot_dice_distribution(axes[1, 1], cumulative_dice_path, "Cumulative Accuracy")
+        if 'cumulative' in mse_dfs:
+            render_mse_plot(axes[1, 1], mse_dfs['cumulative'], "Cumulative Reconstruction Error", global_mse_max)
         else:
             axes[1, 1].set_axis_off()
     else:
-        # Add x-labels to the variance row if dice row is missing
         axes[0, 0].set_xlabel("Principal Component Index")
         axes[0, 1].set_xlabel("Principal Component Index")
 

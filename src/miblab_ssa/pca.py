@@ -13,40 +13,9 @@ import dask.delayed
 import pandas as pd
 from dask_ml.decomposition import PCA as daskPCA
 
-
 from miblab_ssa.metrics import dice_coefficient
 
 
-
-def features_from_dataset_in_npz(
-    features_from_mask:Callable,
-    masks:list, 
-    filepath:str, 
-    labels:list,
-    **kwargs, # kwargs for features_from_mask
-):
-
-    logging.info("Features: scheduling tasks..")
-    tasks = [
-        dask.delayed(features_from_mask)(mask, **kwargs) 
-        for mask in masks
-    ]
-    logging.info('Features: computing..')
-    with ProgressBar():
-        features = dask.compute(*tasks)
-    feature_matrix = np.stack(features, axis=0, dtype=np.float32)
-
-    logging.info('Features: saving..')
-    if not filepath.endswith('.npz'):
-        filepath += '.npz'
-    np.savez_compressed(
-        filepath, 
-        features=feature_matrix, 
-        original_shape=masks[0].shape, 
-        labels=labels,
-        **kwargs,
-    )
-    logging.info('Spectral features: finished..')
 
 def pca_from_features_npz(feature_file, pca_file):
     """
@@ -142,68 +111,64 @@ def modes_from_pca_npz(
 
 
 
-def features_from_dataset_zarr(
-    features_from_mask: Callable,
-    masks_zarr_path: str,
-    output_zarr_path: str,
-    **kwargs
+def pca_from_features_zarr(
+    features_zarr_path: str, 
+    output_zarr_path: str, 
+    n_components=None
 ):
-    # 1. Open Input and Probe Shape
-    input_root = zarr.open(masks_zarr_path, mode='r')
-    n_samples = input_root['masks'].shape[0]
+    """
+    Standard Scikit-Learn PCA: Loads the entire feature matrix into RAM.
+    Best for cases where N_samples * N_features * 4 bytes < Available RAM.
+    """
+    logging.info(f"PCA: Loading data from {os.path.basename(features_zarr_path)} into RAM...")
+
+    # 1. Load Data from Zarr directly into NumPy
+    feat_root = zarr.open(features_zarr_path, mode='r')
+    data = feat_root['features'][:]  # The [:] loads the whole array into memory
+    labels = feat_root['labels'][:]
     
-    # Run one probe to get n_features (Order 32 -> 6545)
-    sample_mask = input_root['masks'][0]
-    sample_feat = features_from_mask(sample_mask, **kwargs)
-    n_features = sample_feat.shape[0]
-    dtype = sample_feat.dtype
+    n_samples, n_features = data.shape
+    logging.info(f"PCA: Matrix shape {n_samples}x{n_features}. Fitting Sklearn PCA...")
+
+    # 2. Fit Scikit-Learn PCA
+    # 'auto' or 'full' works best here since we are in-memory
+    pca = PCA(n_components=n_components, svd_solver='auto')
+    pca.fit(data)
+
+    # 3. Prepare Output Zarr
+    if not output_zarr_path.endswith('.zarr'):
+        output_zarr_path += '.zarr'
     
-    # 2. Pre-allocate Output Zarr on Disk
-    # chunks=(1, n_features) means each row is an independent file on disk
+    root = zarr.open_group(output_zarr_path, mode='w')
     compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
-    output_root = zarr.open(output_zarr_path, mode='w')
-    z_features = output_root.create_dataset(
-        'features', 
-        shape=(n_samples, n_features), 
-        chunks=(1, n_features), 
-        dtype=dtype, 
-        compressor=compressor,
-        overwrite=True
-    )
+
+    # 4. Save Results
+    logging.info("PCA: Saving model attributes to Zarr...")
+
+    # Save the basis (components)
+    root.create_dataset('components', 
+                        data=pca.components_.astype(np.float32), 
+                        chunks=(1, n_features),
+                        compressor=compressor)
+
+    # Save metadata and model parameters
+    root.create_dataset('mean', 
+                        data=pca.mean_.astype(np.float32), 
+                        compressor=compressor)
     
-    # 3. Define the Atomic "Read-Compute-Write" Task
-    @dask.delayed
-    def process_and_write(idx):
-        # WORKER-SIDE: Open input
-        in_store = zarr.open(masks_zarr_path, mode='r')
-        mask = in_store['masks'][idx]
-        
-        # Compute
-        feat = features_from_mask(mask, **kwargs)
-        
-        # WORKER-SIDE: Open output and write to specific slice
-        # Zarr handles concurrent writes to DIFFERENT chunks safely
-        out_store = zarr.open(output_zarr_path, mode='a')
-        out_store['features'][idx] = feat.astype(dtype)
-        
-        return True # Signal success
-
-    # 4. Create Task List
-    tasks = [process_and_write(i) for i in range(n_samples)]
-
-    # 5. Execute
-    logging.info(f"Computing {n_samples} samples with direct-to-disk writing...")
-    with ProgressBar():
-        dask.compute(*tasks)
-
-    # 6. Copy Metadata
-    output_root.create_dataset('labels', data=input_root['labels'][:])
-    output_root.attrs['original_shape'] = input_root['masks'].shape[1:]
-    output_root.attrs['kwargs'] = kwargs
+    root.create_dataset('variance', 
+                        data=pca.explained_variance_.astype(np.float32))
     
-    logging.info("Feature calculation complete.")
+    root.create_dataset('variance_ratio', 
+                        data=pca.explained_variance_ratio_.astype(np.float32))
+    
+    root.create_dataset('labels', data=labels)
 
+    # 5. Transfer Attributes (Essential for reconstruction)
+    root.attrs['original_shape'] = feat_root.attrs.get('original_shape', None)
+    root.attrs['kwargs'] = feat_root.attrs.get('kwargs')
 
+    logging.info("PCA: Finished.")
 
 
 def direct_pca_from_features_zarr(
@@ -288,7 +253,8 @@ def direct_pca_from_features_zarr(
 
     logging.info(f"PCA: Finished successfully.")
 
-def pca_from_features_zarr(
+
+def dask_pca_from_features_zarr(
     features_zarr_path: str, 
     output_zarr_path: str, 
     n_components=None,
@@ -379,8 +345,72 @@ def pca_from_features_zarr(
 def scores_from_features_zarr(
     features_zarr_path, 
     pca_zarr_path, 
+    output_zarr_path
+):
+    """
+    Computes PCA scores entirely in memory using NumPy.
+    Optimized for speed when RAM is sufficient.
+    """
+    logging.info(f"Loading data from {os.path.basename(features_zarr_path)} into RAM...")
+    
+    # 1. Load Input Data into RAM
+    feat_root = zarr.open(features_zarr_path, mode='r')
+    features = feat_root['features'][:] # (N, F)
+    labels = feat_root['labels'][:]
+    
+    # 2. Load PCA Basis into RAM
+    pca_root = zarr.open(pca_zarr_path, mode='r')
+    mu = pca_root['mean'][:]               # (F,)
+    eig_vecs = pca_root['components'][:]   # (K, F)
+    var = pca_root['variance'][:]          # (K,)
+    var_ratio = pca_root['variance_ratio'][:] 
+
+    # 3. Compute Projections (NumPy Math)
+    logging.info("Computing projections (Matrix Multiplication)...")
+    
+    # Centering
+    centered = features - mu
+    
+    # Projection: (N, F) @ (F, K) -> (N, K)
+    # Using .T on eig_vecs to get the correct shape for dot product
+    scores = centered @ eig_vecs.T
+    
+    # Normalization: (N, K) / (K,)
+    logging.info("Normalizing scores...")
+    normalized_scores = scores / np.sqrt(var)
+
+    # 4. Save to Zarr
+    logging.info(f"Saving results to {output_zarr_path}...")
+    root = zarr.open_group(output_zarr_path, mode='w')
+    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
+
+    # Save scores
+    root.create_dataset('scores', 
+                        data=scores.astype(np.float32), 
+                        compressor=compressor)
+    
+    # Save normalized scores
+    root.create_dataset('normalized_scores', 
+                        data=normalized_scores.astype(np.float32), 
+                        compressor=compressor)
+
+    # Save metadata
+    root.create_dataset('labels', data=labels)
+    root.create_dataset('variance', data=var.astype(np.float32))
+    root.create_dataset('variance_ratio', data=var_ratio.astype(np.float32))
+    
+    # Copy essential attributes for reconstruction
+    root.attrs['original_shape'] = feat_root.attrs.get('original_shape')
+    root.attrs['kwargs'] = feat_root.attrs.get('kwargs')
+
+    logging.info("Finished PCA projection.")
+    return scores, normalized_scores
+
+
+def dask_scores_from_features_zarr(
+    features_zarr_path, 
+    pca_zarr_path, 
     output_zarr_path, 
-    chunk_size=100
 ):
     """
     Memory usage:
@@ -390,10 +420,8 @@ def scores_from_features_zarr(
     logging.info("Connecting to Zarr stores (Lazy)...")
     
     # 1. Open Zarr as Dask Arrays
-    # We chunk by 'chunk_size' samples and ALL features (-1)
-    features = da.from_zarr(features_zarr_path, component='features').rechunk({0: chunk_size, 1: -1})
+    features = da.from_zarr(features_zarr_path, component='features')
     labels = da.from_zarr(features_zarr_path, component='labels')
-
     pca_root = zarr.open(pca_zarr_path, mode='r')
     
     # PCA attributes are small enough to compute/load once, 
@@ -447,13 +475,17 @@ def scores_from_features_zarr(
     root.create_dataset('labels', data=labels.compute())
     root.create_dataset('variance', data=var.compute())
     root.create_dataset('variance_ratio', data=var_ratio)
+
+    # Copy essential attributes for reconstruction
+    feat_root = zarr.open(features_zarr_path, mode='r')
+    root.attrs['original_shape'] = feat_root.attrs.get('original_shape')
+    root.attrs['kwargs'] = feat_root.attrs.get('kwargs')
     
     logging.info("Finished PCA projection.")
     return True
 
 
 def modes_from_pca_zarr(
-    mask_from_features: Callable,
     pca_zarr_path: str, 
     modes_zarr_path: str, 
     n_components=8, 
@@ -472,18 +504,13 @@ def modes_from_pca_zarr(
     z_pca = zarr.open(pca_zarr_path, mode='r')
     
     # Check bounds of stored components
+    n_features = z_pca['components'].shape[1]
     stored_k = z_pca['components'].shape[0]
     limit_k = min(n_components, stored_k)
     
-    # Load Mean and Metadata
-    # mean and sdev are small (F,), safe for RAM
+    # Load Mean and Metadata and create coeffs
     avr = z_pca['mean'][:]
     sdev = np.sqrt(z_pca['variance'][:limit_k])
-    
-    shape = tuple(z_pca.attrs['original_shape'])
-    kwargs = z_pca.attrs.get('kwargs') 
-
-    # 2. Setup Step Coefficients
     coeffs_range = np.linspace(-max_coeff, max_coeff, n_coeffs)
 
     # 3. Setup 5D Output Store
@@ -492,157 +519,194 @@ def modes_from_pca_zarr(
         
     store = zarr.DirectoryStore(modes_zarr_path)
     root = zarr.group(store=store, overwrite=True)
-    
-    # Shape: (Steps, Modes, D, H, W)
-    out_shape = (n_coeffs, limit_k) + shape
-    # Chunking by 1 mask per chunk is perfect for 3D slice viewers
-    chunks = (1, 1) + shape 
-    
+    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
+
     z_modes = root.create_dataset(
-        'modes',
-        shape=out_shape,
-        chunks=chunks,
-        dtype=bool,
-        compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
+        'features',
+        shape=(n_coeffs, limit_k, n_features) ,
+        chunks=(1, 1, n_features),
+        dtype=np.float32,
+        compressor=compressor,
     )
-    
-    # Save attributes for the visualization tool
-    root.attrs['coeffs'] = coeffs_range.tolist()
-    root.attrs['n_components'] = limit_k
 
     # 4. Generate Modes (The "Safe" Loop)
-    logging.info(f"Modes: Reconstructing {n_coeffs * limit_k} volumes...")
+    msg = f"Modes: Building {n_coeffs * limit_k} feature vectors..."
+    logging.info(msg)
+    for i in tqdm(range(limit_k), desc=msg):
     
-    # OPTIMIZATION: We only load ONE principal component into RAM at a time.
-    # If F=2,000,000, loading all 100 components at once is 800MB.
-    # Loading one at a time is only 8MB.
-    for i in tqdm(range(limit_k), desc=f"Modes: Reconstructing {n_coeffs * limit_k} volumes..."):
-        # Load ONE component vector (1, F)
         current_comp = z_pca['components'][i, :]
-        
         for j in range(n_coeffs):
-            # Formula: x = mean + (deviation_scalar * eigen_vector)
-            # coeffs_range[j] is the sigma (e.g. -2.0, 0.0, 2.0)
             feat_vec = avr + (coeffs_range[j] * sdev[i] * current_comp)
-            
-            # Reconstruct the 3D volume from the 1D feature vector
-            mask_3d = mask_from_features(feat_vec, shape, **kwargs)
-            
-            # Explicitly cast to bool before writing to save Zarr buffer space
-            z_modes[j, i, ...] = mask_3d.astype(bool)
+            z_modes[j, i, ...] = feat_vec
 
+    # 5. Save attributes for the visualization tool
+    root.create_dataset('labels', data=z_pca['labels'][:])
+    root.attrs['coeffs'] = coeffs_range.tolist()
+    root.attrs['kwargs'] = z_pca.attrs.get('kwargs')
+    root.attrs['original_shape'] = z_pca.attrs.get('original_shape')
+    
     logging.info(f"Modes: Successfully saved to {modes_zarr_path}")
 
 
 
-def masks_from_scores_zarr(
-    mask_from_features: Callable,
-    pca_zarr_path: str, 
-    scores_zarr_path: str,
-    output_zarr_path: str,
-    target_labels: list = None,
-    components: list = None,
-    chunk_size: int = 10  # Process N reconstructions before clearing cache
+def features_from_scores_zarr(
+    pca_zarr_path, 
+    scores_zarr_path,
+    output_zarr_path,
+    target_labels=None,
+    components=None,
 ):
-    """
-    Memory-safe reconstruction of 3D masks from PCA scores.
-
-    memory usage: n_components x n_features x 4 + mask size x (mask_from_features buffer)
-    """
-    # 1. Open Zarr Stores lazily
     z_pca = zarr.open(pca_zarr_path, mode='r')
     z_scores = zarr.open(scores_zarr_path, mode='r')
     
-    # Load small metadata into RAM
-    avr = z_pca['mean'][:]  # 40MB - Safe
-    shape = tuple(z_pca.attrs['original_shape'])
-    kwargs = z_pca.attrs.get('kwargs', {})
+    # Use .get() or check keys to prevent KeyErrors
+    avr = z_pca['mean'][:] 
+    n_features = z_pca['components'].shape[1]
     
-    # Handle labels
-    all_labels = [str(l) for l in z_scores['labels'][:]]
+    # Optimization: Pre-load components once
+    if components is not None:
+        # Ensure components is a sorted list for better Zarr access
+        eig_vecs = z_pca['components'].get_basic_selection(np.sort(components))
+    else:
+        eig_vecs = z_pca['components'][:] # Load all if they fit in RAM
+
+    # Label indexing
+    all_labels = z_scores['labels'][:].astype(str)
     label_to_idx = {l: i for i, l in enumerate(all_labels)}
     
     if target_labels is not None:
-        valid_indices = [label_to_idx[l] for l in target_labels if l in label_to_idx]
-        found_labels = [l for l in target_labels if l in label_to_idx]
+        valid_indices = [label_to_idx[str(l)] for l in target_labels if str(l) in label_to_idx]
+        found_labels = [str(l) for l in target_labels if str(l) in label_to_idx]
     else:
         valid_indices = list(range(len(all_labels)))
         found_labels = all_labels
 
-    if not valid_indices:
-        logging.error("No valid labels found.")
-        return
-
-    # 2. Optimized Component Loading
-    # Instead of loading 41GB, we only load the subset of rows we actually use.
-    logging.info("Loading required PCA components...")
-    if components is not None:
-        # Load only specific rows (e.g., top 100 components = ~4GB)
-        eig_vecs = z_pca['components'].get_basic_selection(components)
-    else:
-        # If None, we point to the whole dataset but DO NOT use [:]
-        # This remains a Zarr Array object (on-disk)
-        eig_vecs = z_pca['components']
-
-    # 3. Setup Output Store
     store = zarr.DirectoryStore(output_zarr_path)
     root = zarr.group(store=store, overwrite=True)
+    
     z_recons = root.create_dataset(
-        'reconstructed_masks',
-        shape=(len(valid_indices),) + shape,
-        chunks=(1,) + shape,
-        dtype=bool,
-        compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
+        'features',
+        shape=(len(valid_indices), n_features),
+        chunks=(1, n_features),
+        dtype='float32',
+        compressor=zarr.Blosc(cname='zstd', clevel=3)
     )
-    root.create_dataset('labels', data=found_labels, dtype=object)
+    # Map to fixed-length string or object to avoid Zarr string errors
+    root.array('labels', data=found_labels)
 
-    # 4. Reconstruction Loop
-    logging.info(f"Reconstructing {len(valid_indices)} volumes...")
-
+    eig_vecs = z_pca['components'][:]
     for i, idx in enumerate(valid_indices):
-        # Retrieve score for this subject
-        full_score = z_scores['scores'][idx, :]
+        score = z_scores['scores'][idx]
         
         if components is not None:
-            limited_score = full_score[components]
-            # limited_vecs is already in RAM as a subset
-            projection = np.dot(limited_score, eig_vecs)
-        else:
-            # If all components are needed, we compute the dot product 
-            # without loading the whole 41GB array into a single variable.
-            # Zarr's __getitem__ handles the buffering.
-            projection = np.dot(full_score, eig_vecs)
-        
-        # Features = Mean + Projection
-        feat_vec = avr + projection
-        
-        # Generate 3D volume
-        mask_3d = mask_from_features(feat_vec, shape, **kwargs)
-        z_recons[i, ...] = mask_3d.astype(bool)
-        
-        if (i + 1) % chunk_size == 0:
-            logging.info(f"Progress: {i+1}/{len(valid_indices)} masks completed.")
+            # Match scores to the loaded eigen_vectors
+            score = score[components]
+            
+        # Standard reconstruction: mean + (scores @ components)
+        z_recons[i] = (avr + np.dot(score, eig_vecs)).astype(np.float32)
 
-    logging.info("Reconstruction finished successfully.")
+    logging.info("Reconstruction finished.")
 
+
+def cumulative_features_from_scores_zarr(
+    pca_zarr_path: str, 
+    scores_zarr_path: str,
+    output_zarr_path: str,
+    target_labels: list = None,
+    max_components: int = 10,
+    step_size: int = 1
+):
+    z_pca = zarr.open(pca_zarr_path, mode='r')
+    z_scores = zarr.open(scores_zarr_path, mode='r')
+    
+    avr = z_pca['mean'][:].astype(np.float32) 
+    n_features = z_pca['components'].shape[1]
+    
+    # Calculate checkpoint indices
+    save_indices = np.arange(step_size - 1, max_components, step_size)
+    
+    # +1 for the Average Kidney at the start
+    n_steps = len(save_indices) + 1 
+    eig_vecs = z_pca['components'][:max_components].astype(np.float32)
+
+    # 1. Handle Labels and Indices (The Filter)
+    all_labels = z_scores['labels'][:].astype(str)
+    label_to_idx = {l: i for i, l in enumerate(all_labels)}
+    
+    if target_labels is not None:
+        valid_indices = [label_to_idx[str(l)] for l in target_labels if str(l) in label_to_idx]
+        found_labels = [str(all_labels[idx]) for idx in valid_indices]
+    else:
+        valid_indices = list(range(len(all_labels)))
+        found_labels = all_labels.tolist()
+
+    n_samples = len(valid_indices)
+
+    # 2. Setup Output Store
+    root = zarr.open(output_zarr_path, mode='w')
+    root.attrs.update(z_pca.attrs) 
+    # Metadata: Step 0 is 'Average', subsequent are PCA checkpoints
+    root.attrs['saved_steps'] = [0] + (save_indices + 1).tolist() 
+
+    # --- Explicit Dataset Creation ---
+    root.create_dataset('labels', data=np.array(found_labels, dtype='U'), overwrite=True)
+    
+    z_recons = root.create_dataset(
+        'features',
+        shape=(n_samples, n_steps, n_features),
+        chunks=(1, 1, n_features),
+        dtype='float32',
+        compressor=zarr.Blosc(cname='zstd', clevel=3),
+        overwrite=True
+    )
+
+    z_mse_vs_avg = root.create_dataset(
+        'mse_vs_avg',
+        shape=(n_samples, n_steps),
+        dtype='float32',
+        overwrite=True
+    )
+
+    # 4. Cumulative Loop
+    logging.info(f"Reconstructing {n_samples} samples in {n_steps} steps (Step 0 = Average)...")
+
+    for i, idx in tqdm(enumerate(valid_indices), total=n_samples):
+        # --- Step 0: Save the Average ---
+        z_recons[i, 0, :] = avr
+        z_mse_vs_avg[i, 0] = 0.0 # MSE vs itself is 0
+        
+        scores = z_scores['scores'][idx, :max_components]
+        current_reconstruction = avr.copy()
+        
+        # Start counter at 1 because index 0 is the Average
+        step_counter = 1 
+        for k in range(max_components):
+            current_reconstruction += (scores[k] * eig_vecs[k])
+            
+            if k in save_indices:
+                z_recons[i, step_counter, :] = current_reconstruction
+                mse = np.mean((avr - current_reconstruction)**2)
+                z_mse_vs_avg[i, step_counter] = mse
+                step_counter += 1
+
+    return True
 
 
 def pca_performance(
-    mask_from_features: Callable, 
     pca_zarr_path: str, 
     scores_zarr_path: str, 
-    original_masks_zarr_path: str, 
-    marginal_dice_path: str,
-    cumulative_dice_path: str,
+    original_features_zarr_path: str, 
+    marginal_mse_path: str,
+    cumulative_mse_path: str,
     n_components: int = 50,
-    overwrite: bool = False,
+    overwrite: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     
     # 1. Open Zarr Stores
     try:
         z_pca = zarr.open(pca_zarr_path, mode='r')
         z_scores = zarr.open(scores_zarr_path, mode='r')
-        z_orig = zarr.open(original_masks_zarr_path, mode='r')
+        z_orig = zarr.open(original_features_zarr_path, mode='r')
     except Exception as e:
         logging.error(f"Failed to open Zarr stores: {e}")
         raise
@@ -650,8 +714,6 @@ def pca_performance(
     # 2. Load Shared Basis and Metadata
     avr = z_pca['mean'][:]
     eig_vecs = z_pca['components'][:n_components, :]
-    shape = tuple(z_pca.attrs['original_shape'])
-    kwargs = z_pca.attrs.get('kwargs', {})
     
     labels_scores = [str(l) for l in z_scores['labels'][:]]
     labels_orig = [str(l) for l in z_orig['labels'][:]]
@@ -659,19 +721,19 @@ def pca_performance(
     n_samples = len(labels_scores)
     
     # 3. Initialize or Load Progress
-    marginal_dice = np.zeros((n_samples, n_components), dtype=np.float32)
-    cumulative_dice = np.zeros((n_samples, n_components), dtype=np.float32)
+    marginal_mse = np.zeros((n_samples, n_components), dtype=np.float32)
+    cumulative_mse = np.zeros((n_samples, n_components), dtype=np.float32)
 
-    if not overwrite and os.path.exists(cumulative_dice_path) and os.path.exists(marginal_dice_path):
-        logging.info("Resuming from existing Dice score files...")
+    if not overwrite and os.path.exists(cumulative_mse_path) and os.path.exists(marginal_mse_path):
+        logging.info("Resuming from existing MSE files...")
         try:
-            marginal_dice = pd.read_csv(marginal_dice_path, index_col=0).values.astype(np.float32)
-            cumulative_dice = pd.read_csv(cumulative_dice_path, index_col=0).values.astype(np.float32)
+            marginal_mse = pd.read_csv(marginal_mse_path, index_col=0).values.astype(np.float32)
+            cumulative_mse = pd.read_csv(cumulative_mse_path, index_col=0).values.astype(np.float32)
             # Ensure shape matches current n_components
-            if marginal_dice.shape[1] != n_components:
+            if marginal_mse.shape[1] != n_components:
                 logging.warning("Saved file component count differs from n_components. Restarting.")
-                marginal_dice = np.zeros((n_samples, n_components), dtype=np.float32)
-                cumulative_dice = np.zeros((n_samples, n_components), dtype=np.float32)
+                marginal_mse = np.zeros((n_samples, n_components), dtype=np.float32)
+                cumulative_mse = np.zeros((n_samples, n_components), dtype=np.float32)
         except Exception as e:
             logging.error(f"Could not load progress: {e}. Starting fresh.")
 
@@ -686,13 +748,14 @@ def pca_performance(
         
         # Check if subject is already computed (all zeros in cumulative row)
         # We check [i, -1] because the last component is the most likely to be filled last
-        if not overwrite and np.any(cumulative_dice[i, :]):
+        if not overwrite and np.any(cumulative_mse[i, :]):
             continue
             
         # --- Computation ---
         orig_idx = orig_label_to_idx[label]
-        orig_mask = z_orig['masks'][orig_idx]
+        orig_features = z_orig['features'][orig_idx]
         subject_scores = z_scores['scores'][i, :n_components]
+        orig_features_norm = np.linalg.norm(orig_features)
         
         current_cumulative_vec = avr.copy()
         
@@ -702,18 +765,16 @@ def pca_performance(
             
             # Marginal Reconstruction
             marginal_feat_vec = avr + (score_k * vec_k)
-            m_recon = mask_from_features(marginal_feat_vec, shape, **kwargs)
-            marginal_dice[i, k] = dice_coefficient(m_recon, orig_mask)
+            marginal_mse[i, k] = np.linalg.norm(marginal_feat_vec-orig_features)/orig_features_norm
             
             # Cumulative Reconstruction
             current_cumulative_vec += (score_k * vec_k)
-            c_recon = mask_from_features(current_cumulative_vec, shape, **kwargs)
-            cumulative_dice[i, k] = dice_coefficient(c_recon, orig_mask)
+            cumulative_mse[i, k] = np.linalg.norm(current_cumulative_vec-orig_features)/orig_features_norm
         
         # 5. Save Progress per Subject
         # Doing this per subject is a good balance between safety and performance
-        pd.DataFrame(marginal_dice, index=labels_scores).to_csv(marginal_dice_path)
-        pd.DataFrame(cumulative_dice, index=labels_scores).to_csv(cumulative_dice_path)
+        pd.DataFrame(marginal_mse, index=labels_scores).to_csv(marginal_mse_path)
+        pd.DataFrame(cumulative_mse, index=labels_scores).to_csv(cumulative_mse_path)
 
     logging.info(f"Performance evaluation complete.")
-    return marginal_dice, cumulative_dice
+    return marginal_mse, cumulative_mse

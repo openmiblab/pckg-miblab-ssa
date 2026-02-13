@@ -1,128 +1,107 @@
 import numpy as np
-from scipy.ndimage import distance_transform_edt
-from sklearn.linear_model import Ridge
-from sklearn.metrics.pairwise import euclidean_distances
-from scipy.ndimage import label, center_of_mass
-from tqdm import tqdm
+import gc
+from scipy.ndimage import distance_transform_edt, label
+from itertools import product
 
-def features_from_mask(mask, grid_size=12, epsilon=2.0, n_samples=50000, random_seed=42):
+def get_rbf_basis(x, n_centers, epsilon=None):
     """
-    Extracts RBF weights as shape features.
-    grid_size: number of RBF centers per axis (12^3 = 1728 features).
-    epsilon: width of the Gaussian kernel.
+    Generates a 1D Gaussian RBF basis matrix.
     """
-    np.random.seed(random_seed)
+    centers = np.linspace(-1, 1, n_centers)
+    if epsilon is None:
+        # Standard heuristic for Gaussian overlap
+        epsilon = 1.0 / (centers[1] - centers[0])
+    
+    # Compute Gaussian: exp(-(epsilon * dist)^2)
+    dists_sq = (x[:, None] - centers[None, :])**2
+    basis = np.exp(-epsilon**2 * dists_sq)
+    return basis.astype(np.float32)
 
-    # 1. Define Fixed Coordinate System
+def features_from_mask(mask, order=12, epsilon=2.0, n_samples=60000):
     nz, ny, nx = mask.shape
-    center = np.array([nz, ny, nx]) / 2.0
-    scale = np.max([nz, ny, nx]) / 2.0
+    center = np.array([nz, ny, nx], dtype=np.float32) / 2.0
+    scale = np.max([nz, ny, nx]).astype(np.float32) / 2.0
 
-    # 2. Compute SDF
-    sdf = (5.0 * np.tanh(distance_transform_edt(~mask) - 
-                         distance_transform_edt(mask)) / 5.0).astype(np.float32)
+    sdf = (distance_transform_edt(1 - mask) - distance_transform_edt(mask)).astype(np.float32)
     
-    # 3. Sampling (Same as your robust strategy)
-    boundary_mask = np.abs(sdf) < 3.0
-    idx_boundary = np.argwhere(boundary_mask)
-    idx_random = np.random.randint(0, [nz, ny, nx], size=(n_samples, 3))
+    # 1. Surface-Biased Sampling
+    idx_boundary = np.argwhere(np.abs(sdf) < 3.0)
+    idx_random = np.random.randint(0, [nz, ny, nx], size=(int(n_samples*0.2), 3))
     
-    n_bound = int(n_samples * 0.5)
-    idx_b_select = idx_boundary[np.random.choice(len(idx_boundary), n_bound, replace=True)]
-    indices = np.vstack([idx_b_select, idx_random])
+    # 2. ANCHORING: Pin the outer shell of the volume to positive (Air)
+    # We use the 8 corners and the centers of the 6 faces
+    anchors = np.array(list(product([0, nz-1], [0, ny-1], [0, nx-1])))
     
-    z_idx, y_idx, x_idx = indices[:, 0], indices[:, 1], indices[:, 2]
-    Values = sdf[z_idx, y_idx, x_idx]
+    b_count = int(n_samples*0.8)
+    idx_b_select = idx_boundary[np.random.choice(len(idx_boundary), b_count)]
     
-    # 4. Normalize Coords to [-1, 1]
-    pts = (indices - center) / scale
-    valid_mask = np.all(np.abs(pts) <= 1, axis=1)
-    pts = pts[valid_mask]
-    Values = Values[valid_mask]
-
-    # 5. Generate RBF Basis
-    # Define a fixed grid of centers across the volume
-    grid = np.linspace(-1, 1, grid_size)
-    centers = np.stack(np.meshgrid(grid, grid, grid, indexing='ij'), axis=-1).reshape(-1, 3)
-
-    # Compute distances between sampled points and fixed centers
-    # Matrix A size: (n_samples, n_centers)
-    dists = euclidean_distances(pts, centers)
-    A = np.exp(-(epsilon * dists)**2) # Gaussian Kernel
-
-    # 6. Solve for Weights (these are your PCA features)
-    clf = Ridge(alpha=1e-3, fit_intercept=False)
-    clf.fit(A, Values)
+    indices = np.vstack([idx_b_select, idx_random, anchors])
+    values = sdf[indices[:, 0], indices[:, 1], indices[:, 2]]
     
-    return clf.coef_.astype(np.float32)
-
-
-
-
-def mask_from_features(coeffs, shape, grid_size=12, epsilon=2.0):
-    """
-    Ultra-fast RBF reconstruction using Gaussian separability.
+    # 3. Weighting & Normalization
+    weights = np.exp(-np.abs(values) / 2.0).astype(np.float32)
+    weights[-len(anchors):] = 100.0 # Heavy penalty for matter at the corners
     
-    Complexity: O(N^3 * K) instead of O(N^3 * K^3)
-    Where N is grid resolution and K is RBF grid size.
-    """
-    vol = np.zeros(shape, dtype=np.uint8)
+    pts = ((indices - center) / scale).astype(np.float32)
+
+    # 1D Bases
+    Bz = get_rbf_basis(pts[:, 0], order, epsilon)
+    By = get_rbf_basis(pts[:, 1], order, epsilon)
+    Bx = get_rbf_basis(pts[:, 2], order, epsilon)
+
+    # Tensor Product Basis Construction
+    A = (Bz[:, :, None, None] * By[:, None, :, None] * Bx[:, None, None, :]).reshape(len(values), -1)
+    A *= weights[:, None]
+    weighted_values = values * weights
+
+    # 4. Solve via Normal Equations
+    n_feat = order**3
+    AtA = A.T @ A
+    Atb = A.T @ weighted_values
+    
+    del A, Bz, By, Bx, sdf, indices
+    gc.collect()
+
+    # High alpha (1e-1) is vital for RBFs to prevent boundary noise
+    AtA.flat[::n_feat + 1] += 1e-1 
+    coeffs = np.linalg.solve(AtA, Atb)
+    
+    return coeffs.astype(np.float32)
+
+def mask_from_features(coeffs, shape, order=12, epsilon=2.0):
     nz, ny, nx = shape
+    center = np.array([nz, ny, nx], dtype=np.float32) / 2.0
+    scale = np.max([nz, ny, nx]).astype(np.float32) / 2.0
     
-    # 1. Coordinate System Setup
-    center = np.array([nz, ny, nx]) / 2.0
-    scale = np.max([nz, ny, nx]) / 2.0
-
-    # 2. Define ROI
-    pad = int(scale * 1.0)
-    z_min, z_max = max(0, int(center[0]-pad)), min(nz, int(center[0]+pad))
-    y_min, y_max = max(0, int(center[1]-pad)), min(ny, int(center[1]+pad))
-    x_min, x_max = max(0, int(center[2]-pad)), min(nx, int(center[2]+pad))
-
-    # 3. Generate 1D Normalized Coordinates
-    z_c = (np.arange(z_min, z_max) - center[0]) / scale
-    y_c = (np.arange(y_min, y_max) - center[1]) / scale
-    x_c = (np.arange(x_min, x_max) - center[2]) / scale
+    z_c = (np.arange(nz) - center[0]) / scale
+    y_c = (np.arange(ny) - center[1]) / scale
+    x_c = (np.arange(nx) - center[2]) / scale
     
-    # 4. Generate 1D RBF Centers
-    grid_1d = np.linspace(-1, 1, grid_size)
+    Bz = get_rbf_basis(z_c, order, epsilon)
+    By = get_rbf_basis(y_c, order, epsilon)
+    Bx = get_rbf_basis(x_c, order, epsilon)
+
+    C_tensor = coeffs.reshape((order, order, order))
+    recon_sdf = np.einsum('ijk,zi,yj,xk->zyx', C_tensor, Bz, By, Bx, optimize='optimal')
     
-    # 5. Build 1D Kernel Matrices
-    # Shape: (ROI_dimension, grid_size)
-    phi_z = np.exp(-(epsilon * (z_c[:, None] - grid_1d[None, :]))**2)
-    phi_y = np.exp(-(epsilon * (y_c[:, None] - grid_1d[None, :]))**2)
-    phi_x = np.exp(-(epsilon * (x_c[:, None] - grid_1d[None, :]))**2)
-
-    # 6. Reshape Weights to 3D Tensor
-    weight_tensor = coeffs.reshape((grid_size, grid_size, grid_size))
-
-    # 7. Fast Tensor Contraction (The Speed Engine)
-    # k, j, i are indices for weight_tensor centers
-    # z, y, x are indices for the output volume voxels
-    recon_roi = np.einsum('kji,zk,yj,xi->zyx', 
-                          weight_tensor, phi_z, phi_y, phi_x, 
-                          optimize='optimal')
-
-    # 8. Threshold and Post-Process
-    # We rebuild a small grid just for the geometric crop
+    # 5. Geometric Crop & Indexing fix
     zz, yy, xx = np.meshgrid(z_c, y_c, x_c, indexing='ij')
-    valid_box = (np.abs(zz) <= 1.0) & (np.abs(yy) <= 1.0) & (np.abs(xx) <= 1.0)
+    valid_box = (np.abs(zz) < 0.98) & (np.abs(yy) < 0.98) & (np.abs(xx) < 0.98)
     
-    mask_roi = (recon_roi < 0) & valid_box
+    mask = (recon_sdf < 0) & valid_box
     
-    if np.any(mask_roi):
-        labeled, n_components = label(mask_roi)
-        if n_components > 1:
-            # ROI center in local coordinates
-            rc = np.array([(z_max-z_min)/2, (y_max-y_min)/2, (x_max-x_min)/2])
-            comp_centers = np.array(center_of_mass(mask_roi, labeled, range(1, n_components+1)))
-            dists = np.linalg.norm(comp_centers - rc, axis=1)
-            mask_roi = (labeled == (np.argmin(dists) + 1))
+    # 6. POST-PROCESS: Keep largest component
+    if np.any(mask):
+        labeled, num_features = label(mask)
+        if num_features > 1:
+            sizes = np.bincount(labeled.ravel())
+            largest_label = sizes[1:].argmax() + 1
+            mask = (labeled == largest_label)
+            
+    return mask.astype(bool)
 
-    vol[z_min:z_max, y_min:y_max, x_min:x_max] = mask_roi
-    return vol
+def smooth_mask(mask:np.ndarray, order=16, epsilon=2.0):
+    coeffs = features_from_mask(mask, order=order, epsilon=epsilon)
+    mask_rec = mask_from_features(coeffs, mask.shape, order=order, epsilon=epsilon)
+    return mask_rec
 
-def smooth_mask(mask:np.ndarray, grid_size=12, epsilon=2.0):
-    coeffs = features_from_mask(mask, grid_size, epsilon)
-    mask_recon = mask_from_features(coeffs, mask.shape, grid_size, epsilon)
-    return mask_recon
