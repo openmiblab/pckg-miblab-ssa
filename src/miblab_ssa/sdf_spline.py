@@ -1,6 +1,6 @@
 import numpy as np
 import gc
-from scipy.ndimage import distance_transform_edt, label
+from scipy.ndimage import distance_transform_edt, label, center_of_mass
 from itertools import product
 from scipy.interpolate import BSpline
 
@@ -86,19 +86,31 @@ def mask_from_features(coeffs, shape, order=12, degree=3):
     # Geometric Crop
     zz, yy, xx = np.meshgrid(z_c, y_c, x_c, indexing='ij')
     valid_box = (np.abs(zz) < 0.95) & (np.abs(yy) < 0.95) & (np.abs(xx) < 0.95)
-    
-    mask = (recon_sdf < 0) & valid_box
-    
-    # POST-PROCESS: Keep only the largest component (The Kidney)
-    if np.any(mask):
-        labeled, num_features = label(mask)
+    recon_sdf = (recon_sdf < 0) & valid_box
+
+    # POST-PROCESS: Select component closest to the center
+    if np.any(recon_sdf):
+        labeled, num_features = label(recon_sdf)
         if num_features > 1:
-            # Sort components by size
-            sizes = np.bincount(labeled.ravel())
-            largest_label = sizes[1:].argmax() + 1
-            mask = (labeled == largest_label)
             
-    return mask.astype(bool)
+            # Get sizes and centers of all components
+            component_indices = np.arange(1, num_features + 1)
+            centroids = center_of_mass(recon_sdf, labeled, component_indices)
+            sizes = np.bincount(labeled.ravel())[1:]
+            
+            # Target center (in voxel coordinates)
+            img_center = np.array(shape) / 2.0
+            
+            # Calculate distance from each component's center to image center
+            distances = [np.linalg.norm(np.array(c) - img_center) for c in centroids]
+            
+            # HYBRID LOGIC: Pick the one that is both reasonably large AND central
+            # Or simply the closest to center if clutter is very large:
+            best_label = component_indices[np.argmin(distances)]
+            
+            recon_sdf = (labeled == best_label)
+
+    return recon_sdf
 
 def smooth_mask(mask:np.ndarray, order=16):
     coeffs = features_from_mask(mask, order=order)

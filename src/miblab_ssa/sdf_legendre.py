@@ -147,8 +147,18 @@ def mask_from_features(coeffs, shape, order):
     # Geometric Crop for high-order stability
     zz, yy, xx = np.meshgrid(z_coords, y_coords, x_coords, indexing='ij')
     valid_box = (np.abs(zz) <= 1.0) & (np.abs(yy) <= 1.0) & (np.abs(xx) <= 1.0)
-    
-    return (recon_sdf < 0) & valid_box
+    recon_sdf = (recon_sdf < 0) & valid_box
+
+    # POST-PROCESS: Keep only the largest component (The Kidney)
+    if np.any(recon_sdf):
+        labeled, num_features = label(recon_sdf)
+        if num_features > 1:
+            # Sort components by size
+            sizes = np.bincount(labeled.ravel())
+            largest_label = sizes[1:].argmax() + 1
+            recon_sdf = (labeled == largest_label)
+
+    return recon_sdf
 
 def smooth_mask(mask:np.ndarray, order=20):
     coeffs = features_from_mask(mask, order=order)

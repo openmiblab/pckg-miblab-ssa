@@ -10,7 +10,32 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 
+class LinearOrderedAutoencoder(nn.Module):
+    def __init__(self, input_dim, latent_dim):
+        super().__init__()
+        self.latent_dim = latent_dim
+        
+        # Simple Linear Encoder
+        self.encoder = nn.Linear(input_dim, latent_dim)
+        
+        # Simple Linear Decoder (Mirrors the Encoder)
+        self.decoder = nn.Linear(latent_dim, input_dim)
 
+    def forward(self, x, mask_dim=None):
+        # 1. Encode to latent space (Scores)
+        z = self.encoder(x)
+        
+        # 2. Apply Nested Dropout (Ordering mechanism)
+        if self.training and mask_dim is not None:
+            # Create a mask that zeros out all components after index 'mask_dim'
+            mask = torch.zeros_like(z)
+            mask[:, :mask_dim] = 1.0
+            z = z * mask
+        
+        # 3. Decode back to feature space
+        recon = self.decoder(z)
+        
+        return recon, z
 
 class OrderedAutoencoder(nn.Module):
     def __init__(self, input_dim, latent_dim):
@@ -43,32 +68,7 @@ class OrderedAutoencoder(nn.Module):
         
         return self.decoder(z), z
     
-class LinearOrderedAutoencoder(nn.Module):
-    def __init__(self, input_dim, latent_dim):
-        super().__init__()
-        self.latent_dim = latent_dim
-        
-        # Simple Linear Encoder
-        self.encoder = nn.Linear(input_dim, latent_dim)
-        
-        # Simple Linear Decoder (Mirrors the Encoder)
-        self.decoder = nn.Linear(latent_dim, input_dim)
 
-    def forward(self, x, mask_dim=None):
-        # 1. Encode to latent space (Scores)
-        z = self.encoder(x)
-        
-        # 2. Apply Nested Dropout (Ordering mechanism)
-        if self.training and mask_dim is not None:
-            # Create a mask that zeros out all components after index 'mask_dim'
-            mask = torch.zeros_like(z)
-            mask[:, :mask_dim] = 1.0
-            z = z * mask
-        
-        # 3. Decode back to feature space
-        recon = self.decoder(z)
-        
-        return recon, z
 
 class ZarrStreamingDataset(Dataset):
     def __init__(self, zarr_path):
@@ -101,7 +101,7 @@ def deep_pca_from_features_zarr(
     n_features = dataset.data.shape[1]
 
     # 2. Initialize Model
-    model = LinearOrderedAutoencoder(n_features, n_components)
+    model = OrderedAutoencoder(n_features, n_components)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
 
