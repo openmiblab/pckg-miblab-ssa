@@ -1,12 +1,90 @@
 from typing import Callable
 import logging
-import dask
 from tqdm import tqdm
 import zarr
-import dask.delayed
 import numpy as np
 import gc
 from joblib import Parallel, delayed
+import pandas as pd
+import os
+import numpyradiomics as npr
+
+from miblab_ssa.metrics import dice_coefficient, surface_distances
+
+
+
+def _process_sample_orders(smooth_mask_func, zarr_path, sample_idx, min_order, max_order):
+    """Worker function to compute both Dice and Hausdorff for all orders."""
+    try:
+        root = zarr.open(zarr_path, mode='r')
+        orig_mask = root['masks'][sample_idx]
+        
+        dice_results = {}
+        haus_results = {}
+        
+        for n in range(min_order, max_order + 1):
+            reconstructed = smooth_mask_func(orig_mask, order=n)
+            
+            # Calculate both metrics
+            dice_results[n] = dice_coefficient(orig_mask, reconstructed)
+            haus_results[n], _ = surface_distances(orig_mask, reconstructed)
+            
+        return sample_idx, dice_results, haus_results
+    except Exception as e:
+        print(f"Error processing sample {sample_idx}: {e}")
+        return sample_idx, None, None
+
+def reconstruction_fidelity(
+    smooth_mask_func: Callable = None,
+    dataset_zarr_path: str = None,
+    dice_csv_path: str = None,
+    hausdorff_csv_path: str = None,
+    min_order: int = 2,
+    max_order: int = 36,
+    n_jobs: int = -1
+):
+    """
+    Builds two CSVs (Dice and Hausdorff) across spectral reconstruction orders.
+    """
+    # 1. Setup dimensions and labels
+    root = zarr.open(dataset_zarr_path, mode='r')
+    n_samples = root['masks'].shape[0]
+    labels = [str(l) for l in root['labels'][:]]
+
+    # 2. Parallel Processing
+    print(f"Evaluating reconstruction fidelity for {n_samples} samples up to order {max_order}...")
+    
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_process_sample_orders)(smooth_mask_func, dataset_zarr_path, i, min_order, max_order)
+        for i in tqdm(range(n_samples))
+    )
+
+    # 3. Aggregate results into two separate matrices
+    dice_matrix = np.full((n_samples, max_order), np.nan)
+    haus_matrix = np.full((n_samples, max_order), np.nan)
+    
+    for sample_idx, d_results, h_results in results:
+        if d_results is not None:
+            for order in range(1, max_order + 1):
+                dice_matrix[sample_idx, order - 1] = d_results[order]
+                haus_matrix[sample_idx, order - 1] = h_results[order]
+
+    # 4. Save to CSVs
+    order_cols = list(range(min_order, max_order + 1))
+    
+    # Save Dice
+    df_dice = pd.DataFrame(dice_matrix, index=labels, columns=order_cols)
+    df_dice.index.name = "Sample_ID"
+    df_dice.to_csv(dice_csv_path)
+    
+    # Save Hausdorff
+    df_haus = pd.DataFrame(haus_matrix, index=labels, columns=order_cols)
+    df_haus.index.name = "Sample_ID"
+    df_haus.to_csv(hausdorff_csv_path)
+
+    print(f"Fidelity CSVs saved:\n - {dice_csv_path}\n - {hausdorff_csv_path}")
+    
+    return df_dice, df_haus
 
 
 def features_from_dataset(
@@ -146,23 +224,79 @@ def features_from_dataset_sequential(
 
 
 
+def _process_single_subject(i, mask_zarr_path, n_metrics_steps):
+    recon = zarr.open(mask_zarr_path, mode='r')
+    masks = recon['masks']
+    
+    # GT is always at the last index (-1)
+    original = masks[i, -1, ...].astype(np.float32)
+    
+    dice_row = np.zeros(n_metrics_steps, dtype=np.float32)
+    haus_row = np.zeros(n_metrics_steps, dtype=np.float32)
+    
+    for j in range(n_metrics_steps):
+        # This will now correctly process index 0 (Mean) 
+        # through index n-2 (Last reconstruction step)
+        recon_mask = masks[i, j, ...].astype(np.float32)
+        
+        dice_row[j] = 1.0 - dice_coefficient(original, recon_mask)
+        hd, _ = surface_distances(original, recon_mask)
+        haus_row[j] = hd
+            
+    return dice_row, haus_row
+
+def recon_error(
+    dataset_zarr_path: str = None, 
+    dice_csv_path: str = None, 
+    hausdorff_csv_path: str = None, 
+    n_jobs: int = -1,
+):
+    # 1. Load metadata
+    recon = zarr.open(dataset_zarr_path, mode='r')
+    labels = recon['labels'][:].astype(str)
+    cols = recon.attrs['saved_steps']
+    n_samples = recon['masks'].shape[0]
+    
+    # We want to calculate error for every column EXCEPT the last one (GT)
+    # If cols is ["Mean", 1, 5, 10, "GT"], n_metrics_steps is 4
+    n_metrics_steps = len(cols) - 1
+
+    # 2. Parallel Dispatch
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_process_single_subject)(i, dataset_zarr_path, n_metrics_steps) 
+        for i in tqdm(range(n_samples), desc="Parallel Metrics Calculation")
+    )
+
+    # 3. Reconstruct matrices
+    dice_matrix = np.array([r[0] for r in results])
+    haus_matrix = np.array([r[1] for r in results])
+
+    # 4. Save with correct column headers (everything except 'GT')
+    step_names = cols[:-1]
+    
+    pd.DataFrame(dice_matrix, index=labels, columns=step_names).to_csv(dice_csv_path)
+    pd.DataFrame(haus_matrix, index=labels, columns=step_names).to_csv(hausdorff_csv_path)
+    
+    print(f"Metrics saved to {dice_csv_path} and {hausdorff_csv_path}")
+
+
 
 def dataset_from_features(
-    mask_from_features: Callable,
-    features_zarr_path: str,
-    output_zarr_path: str,
+    mask_from_features_func: Callable = None,
+    features_zarr_path: str = None,
+    dataset_zarr_path: str = None,
 ):
     input_root = zarr.open(features_zarr_path, mode='r')
     
     # --- 1. Inherit Metadata and Setup ---
-    kwargs = input_root.attrs.get('kwargs', {})
+    kwargs = input_root.attrs.get('kwargs')
     target_shape = tuple(input_root.attrs['original_shape'])
     feat_ds = input_root['features']
     leading_shape = feat_ds.shape[:-1] 
     n_total_tasks = int(np.prod(leading_shape))
     
     # --- 2. Pre-allocate Output Zarr ---
-    output_root = zarr.open(output_zarr_path, mode='w')
+    output_root = zarr.open(dataset_zarr_path, mode='w')
     output_root.attrs.update(input_root.attrs)
     
     # Copy other datasets (labels, etc.)
@@ -216,7 +350,7 @@ def dataset_from_features(
     # This automatically uses the active Dask Client workers
     results = Parallel(verbose=10)(
         delayed(reconstruct_and_write)(
-            i, features_zarr_path, output_zarr_path, mask_from_features, target_shape, kwargs
+            i, features_zarr_path, dataset_zarr_path, mask_from_features_func, target_shape, kwargs
         ) for i in range(n_total_tasks)
     )
 
@@ -227,6 +361,72 @@ def dataset_from_features(
             logging.error(err)
             
     return True
+
+
+
+def _extract_single_mask(zarr_path, c, r):
+    """Helper function to process a single mask in parallel."""
+    try:
+        # Re-open zarr in each worker to ensure thread/process safety
+        root = zarr.open(zarr_path, mode='r')
+        mask_3d = root['masks'][c, r, :, :, :]
+        features = npr.shape(mask_3d)
+        return c, r, features
+    except Exception as e:
+        return c, r, None
+
+def dataset_shapes(
+    dataset_zarr_path: str = None, 
+    dir_csv: str = None,
+    col_names: str = 'coeffs',
+    row_names: str = 'components',
+    n_jobs: int = -1
+):
+    """
+    Extracts radiomics shape features in parallel using joblib.
+    """
+    # 1. Setup Data and Dimensions
+    root = zarr.open(dataset_zarr_path, mode='r')
+    n_cols, n_rows = root['masks'].shape[0], root['masks'].shape[1]
+    cols_list = root.attrs[col_names]
+    os.makedirs(dir_csv, exist_ok=True)
+
+    # 2. Parallel Extraction
+    print(f"Parallel extraction for {n_cols * n_rows} masks using {n_jobs} cores...")
+    
+    # Generate task list (all combinations of c and r)
+    tasks = [(c, r) for c in range(n_cols) for r in range(n_rows)]
+    
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_extract_single_mask)(dataset_zarr_path, c, r) 
+        for c, r in tqdm(tasks)
+    )
+
+    # 3. Aggregate Results into Grids
+    feature_grids = {}
+
+    for c, r, features in results:
+        if features is None:
+            continue
+            
+        # Initialize grids on the first successful result
+        if not feature_grids:
+            for feat_name in features.keys():
+                feature_grids[feat_name] = np.full((n_rows, n_cols), np.nan)
+
+        for feat_name, value in features.items():
+            feature_grids[feat_name][r, c] = value
+
+    # 4. Save Grids to CSV
+    row_indices = np.arange(1, n_rows + 1)
+    for feat_name, grid in feature_grids.items():
+        df = pd.DataFrame(grid, index=row_indices, columns=cols_list)
+        df.index.name = row_names
+        
+        file_path = os.path.join(dir_csv, f"{feat_name}.csv")
+        df.to_csv(file_path)
+
+    print(f"Done. Files saved to {dir_csv}")
 
 
 def dataset_from_features_sequential(
@@ -288,3 +488,6 @@ def dataset_from_features_sequential(
     #dask.compute(*tasks)
     
     return True
+
+
+

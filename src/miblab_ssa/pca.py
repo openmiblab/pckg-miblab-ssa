@@ -514,27 +514,27 @@ def features_from_scores(
 def cumulative_features_from_scores(
     pca_zarr_path: str, 
     scores_zarr_path: str,
+    original_features_zarr_path: str, # Added to match Deep PCA version
     output_zarr_path: str,
     target_labels: list = None,
     max_components: int = 10,
     step_size: int = 1
 ):
+    # 1. Open Zarr Stores
     z_pca = zarr.open(pca_zarr_path, mode='r')
     z_scores = zarr.open(scores_zarr_path, mode='r')
+    z_orig = zarr.open(original_features_zarr_path, mode='r')
     
     avr = z_pca['mean'][:].astype(np.float32) 
     n_features = z_pca['components'].shape[1]
     
-    # Calculate checkpoint indices
-    save_indices = np.arange(step_size - 1, max_components, step_size)
-    
-    # +1 for the Average Kidney at the start
-    n_steps = len(save_indices) + 1 
-    eig_vecs = z_pca['components'][:max_components].astype(np.float32)
-
-    # 1. Handle Labels and Indices (The Filter)
+    # 2. Handle Labels and Indices
     all_labels = z_scores['labels'][:].astype(str)
     label_to_idx = {l: i for i, l in enumerate(all_labels)}
+    
+    # Matching labels from original features to scores
+    orig_labels = z_orig['labels'][:].astype(str)
+    orig_label_to_idx = {l: i for i, l in enumerate(orig_labels)}
     
     if target_labels is not None:
         valid_indices = [label_to_idx[str(l)] for l in target_labels if str(l) in label_to_idx]
@@ -544,14 +544,19 @@ def cumulative_features_from_scores(
         found_labels = all_labels.tolist()
 
     n_samples = len(valid_indices)
+    
+    # Calculate checkpoint indices
+    save_indices = np.arange(step_size - 1, max_components, step_size)
+    # +2 for Step 0 (Average) and Step -1 (Ground Truth)
+    n_steps = len(save_indices) + 2 
+    eig_vecs = z_pca['components'][:max_components].astype(np.float32)
 
-    # 2. Setup Output Store
+    # 3. Setup Output Store
     root = zarr.open(output_zarr_path, mode='w')
     root.attrs.update(z_pca.attrs) 
-    # Metadata: Step 0 is 'Average', subsequent are PCA checkpoints
-    root.attrs['saved_steps'] = [0] + (save_indices + 1).tolist() 
+    # Metadata: Index 0 is Mean, last index is GT
+    root.attrs['saved_steps'] = [0] + (save_indices + 1).tolist() + ["GT"]
 
-    # --- Explicit Dataset Creation ---
     root.create_dataset('labels', data=np.array(found_labels, dtype='U'), overwrite=True)
     
     z_recons = root.create_dataset(
@@ -563,33 +568,45 @@ def cumulative_features_from_scores(
         overwrite=True
     )
 
-    z_mse_vs_avg = root.create_dataset(
-        'mse_vs_avg',
-        shape=(n_samples, n_steps),
-        dtype='float32',
-        overwrite=True
-    )
+    z_mse_vs_avg = root.create_dataset('mse_vs_avg', shape=(n_samples, n_steps), dtype='float32', overwrite=True)
+    z_recon_error = root.create_dataset('recon_error', shape=(n_samples, n_steps), dtype='float32', overwrite=True)
 
     # 4. Cumulative Loop
-    logging.info(f"Reconstructing {n_samples} samples in {n_steps} steps (Step 0 = Average)...")
+    logging.info(f"Linear Reconstruction: {n_samples} samples, {n_steps} steps (Index -1 is GT)")
 
     for i, idx in tqdm(enumerate(valid_indices), total=n_samples):
+        label = found_labels[i]
+        
+        # Pull Ground Truth for reference
+        if label in orig_label_to_idx:
+            raw_gt = z_orig['features'][orig_label_to_idx[label]].astype(np.float32)
+        else:
+            # Fallback if label missing in original (should not happen with filtered valid_indices)
+            raw_gt = np.zeros(n_features, dtype=np.float32)
+            logging.warning(f"Label {label} not found in original features.")
+
         # --- Step 0: Save the Average ---
         z_recons[i, 0, :] = avr
-        z_mse_vs_avg[i, 0] = 0.0 # MSE vs itself is 0
+        z_mse_vs_avg[i, 0] = 0.0
+        z_recon_error[i, 0] = np.mean((avr - raw_gt)**2)
         
+        # --- Step -1: Save the Ground Truth ---
+        z_recons[i, -1, :] = raw_gt
+        z_mse_vs_avg[i, -1] = np.mean((raw_gt - avr)**2)
+        z_recon_error[i, -1] = 0.0 
+        
+        # --- Intermediate Steps: Linear Summation ---
         scores = z_scores['scores'][idx, :max_components]
         current_reconstruction = avr.copy()
         
-        # Start counter at 1 because index 0 is the Average
         step_counter = 1 
         for k in range(max_components):
             current_reconstruction += (scores[k] * eig_vecs[k])
             
             if k in save_indices:
                 z_recons[i, step_counter, :] = current_reconstruction
-                mse = np.mean((avr - current_reconstruction)**2)
-                z_mse_vs_avg[i, step_counter] = mse
+                z_mse_vs_avg[i, step_counter] = np.mean((current_reconstruction - avr)**2)
+                z_recon_error[i, step_counter] = np.mean((current_reconstruction - raw_gt)**2)
                 step_counter += 1
 
     return True

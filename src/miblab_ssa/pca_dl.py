@@ -3,70 +3,68 @@ import torch.nn as nn
 import zarr
 import numpy as np
 import dask.array as da
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 import logging
 from tqdm import tqdm
+import pandas as pd
+from typing import Tuple
+from sklearn.model_selection import KFold
+import os
 
-import torch
-import torch.nn as nn
-
-class LinearOrderedAutoencoder(nn.Module):
-    def __init__(self, input_dim, latent_dim):
-        super().__init__()
-        self.latent_dim = latent_dim
-        
-        # Simple Linear Encoder
-        self.encoder = nn.Linear(input_dim, latent_dim)
-        
-        # Simple Linear Decoder (Mirrors the Encoder)
-        self.decoder = nn.Linear(latent_dim, input_dim)
-
-    def forward(self, x, mask_dim=None):
-        # 1. Encode to latent space (Scores)
-        z = self.encoder(x)
-        
-        # 2. Apply Nested Dropout (Ordering mechanism)
-        if self.training and mask_dim is not None:
-            # Create a mask that zeros out all components after index 'mask_dim'
-            mask = torch.zeros_like(z)
-            mask[:, :mask_dim] = 1.0
-            z = z * mask
-        
-        # 3. Decode back to feature space
-        recon = self.decoder(z)
-        
-        return recon, z
 
 class OrderedAutoencoder(nn.Module):
     def __init__(self, input_dim, latent_dim):
         super().__init__()
-        # Encoder: Compressing polynomial features
+        
+        # Encoder: Gradual compression from 4094 down to latent_dim
+        # Path: 4094 -> 1024 -> 512 -> 256 -> latent_dim
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 512),
+            nn.Linear(input_dim, 1024),
+            nn.BatchNorm1d(1024),
             nn.ReLU(),
+            
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            
             nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
+            
             nn.Linear(256, latent_dim)
         )
-        # Decoder: Reconstructing the Signed Distance Transform features
+        
+        # Decoder: Mirroring the Encoder
+        # Path: latent_dim -> 256 -> 512 -> 1024 -> 4094
         self.decoder = nn.Sequential(
+            # Note: No BatchNorm here to avoid issues with zero-masking
             nn.Linear(latent_dim, 256),
             nn.ReLU(),
+            
             nn.Linear(256, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Linear(512, input_dim)
+            
+            nn.Linear(512, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(),
+            
+            nn.Linear(1024, input_dim)
         )
 
     def forward(self, x, mask_dim=None):
         z = self.encoder(x)
-        # To force ordering, we can zero out dimensions during training
-        # This is a 'Nested Dropout' approach
+        
+        # Nested Dropout / Ordered Masking
         if self.training and mask_dim is not None:
             mask = torch.zeros_like(z)
             mask[:, :mask_dim] = 1.0
             z = z * mask
         
-        return self.decoder(z), z
+        # If not training, we assume we use the full latent space 
+        # unless you explicitly pass a mask_dim during inference.
+        recon = self.decoder(z)
+        return recon, z
     
 
 
@@ -83,24 +81,24 @@ class ZarrStreamingDataset(Dataset):
         return self.data.shape[0]
 
     def __getitem__(self, idx):
-        # Accesses disk, not RAM
         sample = self.data[idx].astype(np.float32)
         normalized = (sample - self.mean) / self.std
         return torch.from_numpy(normalized)
-
-def deep_pca_from_features_zarr(
-    features_zarr_path, output_zarr_path, model_save_path,
-    n_components=25, epochs=100, batch_size=64
+    
+def deep_pca_from_features(
+    features_zarr_path=None, 
+    model_pth_path=None,
+    n_components=25, 
+    epochs=100, 
+    batch_size=64
 ):
     # 1. Setup Lazy Loading
     logging.info(f"Connecting to {features_zarr_path}...")
     dataset = ZarrStreamingDataset(features_zarr_path)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
-    n_samples = len(dataset)
-    n_features = dataset.data.shape[1]
-
     # 2. Initialize Model
+    n_features = dataset.data.shape[1]
     model = OrderedAutoencoder(n_features, n_components)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
@@ -111,83 +109,138 @@ def deep_pca_from_features_zarr(
         model.train()
         epoch_loss = 0
         for x in loader:
-            # Nested Dropout: Randomly truncate the latent bottleneck
             k = np.random.randint(1, n_components + 1)
             recon, _ = model(x, mask_dim=k)
-            
             loss = criterion(recon, x)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-        
+
         if (epoch + 1) % 10 == 0:
             logging.info(f"Epoch {epoch+1} Loss: {epoch_loss/len(loader):.6f}")
-
-    # 4. Post-Training: Batch-processed Metrics
-    logging.info("Calculating scores and variance ratios...")
-    model.eval()
-    all_scores = []
-    total_mse = [0.0] * n_components
-    
-    with torch.no_grad():
-        # We pass through the data one last time in batches to avoid OOM
-        eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-        for x in eval_loader:
-            full_recon, scores = model(x)
-            all_scores.append(scores)
-            
-            # Calculate MSE for each k-cutoff to derive variance ratios
-            for k in range(1, n_components + 1):
-                mask = torch.zeros_like(scores)
-                mask[:, :k] = 1.0
-                recon_k = model.decoder(scores * mask)
-                total_mse[k-1] += nn.functional.mse_loss(recon_k, x, reduction='sum').item()
-
-    # Aggregate results
-    scores_final = torch.cat(all_scores, dim=0).numpy()
-    latent_std_np = np.std(scores_final, axis=0)
-    total_elements = n_samples * n_features
-    variances = [1 - (mse / total_elements) for mse in total_mse]
-    exp_var_ratio = np.diff([0] + variances)
-
-    # 5. Save results
-    logging.info(f"Saving to {output_zarr_path}...")
-    store = zarr.DirectoryStore(output_zarr_path)
-    root = zarr.group(store=store, overwrite=True)
-    root.create_dataset('scores', data=scores_final.astype(np.float32))
-    root.create_dataset('variance_ratio', data=exp_var_ratio.astype(np.float32))
-    root.create_dataset('labels', data=dataset.root['labels'][:])
     
     # Save Model Checkpoint
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'train_mean': dataset.mean,
         'train_std': dataset.std,
-        'latent_std': latent_std_np,  
         'input_dim': n_features,
-        'latent_dim': n_components
+        'latent_dim': n_components,
+        'original_shape': dataset.root.attrs.get('original_shape'),
+        'kwargs': dataset.root.attrs.get('kwargs'),
     }
-    torch.save(checkpoint, model_save_path)
-    
+    torch.save(checkpoint, model_pth_path)
 
 
 
-
-def deep_scores_from_features_zarr(
-    features_zarr_path, 
-    model_pth_path, 
-    output_zarr_path, 
-    chunk_size=100
+def deep_cv_pca_from_features(
+    features_zarr_path=None, 
+    model_pth_path=None,
+    n_components=25, 
+    epochs=100, 
+    batch_size=64,
+    n_folds=5
 ):
-    """
-    Inference version of the Non-Linear PCA. 
-    Passes unseen features through the trained Encoder to get 'scores'.
-    """
-    logging.info("Loading model and connecting to Zarr...")
+    # 1. Setup Data
+    logging.info(f"Connecting to {features_zarr_path}...")
+    full_dataset = ZarrStreamingDataset(features_zarr_path)
+    n_features = full_dataset.data.shape[1]
+    n_samples = len(full_dataset)
+    
+    # Initialize KFold
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+    
+    # We will track the best model across all folds or aggregate metrics
+    fold_results = []
 
-    # 1. Load the trained model architecture and weights
-    # We assume the model dimensions were saved in the pth or known
+    for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(n_samples))):
+        logging.info(f"--- Starting Fold {fold + 1}/{n_folds} ---")
+        
+        # Create Subsets
+        train_sub = Subset(full_dataset, train_idx)
+        val_sub = Subset(full_dataset, val_idx)
+        
+        train_loader = DataLoader(train_sub, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_sub, batch_size=batch_size, shuffle=False)
+
+        # 2. Initialize Model for this fold
+        model = OrderedAutoencoder(n_features, n_components)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        criterion = nn.MSELoss()
+
+        # 3. Training Loop
+        for epoch in range(epochs):
+            # --- Training Phase ---
+            model.train()
+            train_loss = 0
+            for x in train_loader:
+                k = np.random.randint(1, n_components + 1)
+                recon, _ = model(x, mask_dim=k)
+                loss = criterion(recon, x)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+
+            # --- Validation Phase ---
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for x_val in val_loader:
+                    # Validate on the full bottleneck (no mask) 
+                    # or a random k to match training behavior
+                    recon_val, _ = model(x_val) 
+                    v_loss = criterion(recon_val, x_val)
+                    val_loss += v_loss.item()
+
+            if (epoch + 1) % 10 == 0:
+                avg_train = train_loss / len(train_loader)
+                avg_val = val_loss / len(val_loader)
+                logging.info(f"Fold {fold+1} | Epoch {epoch+1} | Train Loss: {avg_train:.6f} | Val Loss: {avg_val:.6f}")
+
+        fold_results.append(val_loss / len(val_loader))
+
+    # 4. Final Training (on all data) for the production model
+    logging.info(f"Cross-validation complete. Average Val Loss: {np.mean(fold_results):.6f}")
+    logging.info("Training final production model on full dataset...")
+    
+    final_model = OrderedAutoencoder(n_features, n_components)
+    final_optimizer = torch.optim.Adam(final_model.parameters(), lr=1e-3)
+    full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True)
+    
+    for epoch in range(epochs):
+        final_model.train()
+        for x in full_loader:
+            k = np.random.randint(1, n_components + 1)
+            recon, _ = final_model(x, mask_dim=k)
+            loss = criterion(recon, x)
+            final_optimizer.zero_grad()
+            loss.backward()
+            final_optimizer.step()
+    
+    checkpoint = {
+        'model_state_dict': final_model.state_dict(),
+        'train_mean': full_dataset.mean,
+        'train_std': full_dataset.std,
+        'input_dim': n_features,
+        'latent_dim': n_components,
+        'cv_val_losses': fold_results  # Helpful for reporting
+    }
+    torch.save(checkpoint, model_pth_path)
+
+
+
+def add_deep_pca_metrics(
+    features_zarr_path=None, 
+    model_pth_path=None,
+    batch_size=64
+):
+    # 1. Setup Lazy Loading
+    logging.info(f"Connecting to {features_zarr_path}...")
+    dataset = ZarrStreamingDataset(features_zarr_path)
+
     checkpoint = torch.load(model_pth_path)
     input_dim = checkpoint['input_dim']
     latent_dim = checkpoint['latent_dim']
@@ -196,77 +249,425 @@ def deep_scores_from_features_zarr(
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
-    # 2. Open Unseen Data
-    feat_root = zarr.open(features_zarr_path, mode='r')
-    features_da = da.from_zarr(feat_root['features']).rechunk({0: chunk_size, 1: -1})
-    labels = feat_root['labels'][:]
+    # 4. Post-Training: Metrics Calculation
+    model.eval()
+    all_scores = []
     
-    # Load scaling parameters (mean/std) calculated during training
-    # Deep models perform best when input features are z-scored
-    train_mu = torch.from_numpy(checkpoint['train_mean']).float()
-    train_std = torch.from_numpy(checkpoint['train_std']).float()
-    latent_std = torch.from_numpy(checkpoint['latent_std']).float()
+    with torch.no_grad():
+        eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        for x in eval_loader:
+            _, scores = model(x)
+            all_scores.append(scores)
 
-    # 3. Prepare Output Zarr
-    store = zarr.DirectoryStore(output_zarr_path)
-    root = zarr.group(store=store, overwrite=True)
-    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
+    # --- Variance Calculations ---
+    scores_final = torch.cat(all_scores, dim=0).numpy()
+    latent_std = np.std(scores_final, axis=0) + 1e-6
+    latent_mean = np.mean(scores_final, axis=0)
+    # explained_variance = latent_std ** 2
+    # explained_variance_ratio = explained_variance / np.sum(explained_variance)
+
+    checkpoint['latent_std'] = latent_std.astype(np.float32)
+    checkpoint['latent_mean'] = latent_mean.astype(np.float32)
+    torch.save(checkpoint, model_pth_path)
     
-    # Initialize datasets for the scores
+
+
+def deep_scores_from_features(
+    features_zarr_path:str=None, 
+    model_pth_path:str=None, 
+    scores_csv_path:str=None,
+    normalized_scores_csv_path:str = None, 
+    chunk_size=100
+):
+    """
+    Passes unseen features through the trained Encoder and saves 
+    'scores' and 'normalized_scores' as individual CSV files.
+    """
+    logging.info("Loading model and connecting to Zarr...")
+
+    try:
+        # 1. Load the trained model and parameters
+        checkpoint = torch.load(model_pth_path)
+        input_dim = checkpoint['input_dim']
+        latent_dim = checkpoint['latent_dim']
+
+        model = OrderedAutoencoder(input_dim, latent_dim)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+
+        # 2. Open Unseen Data
+        feat_gt = zarr.open(features_zarr_path, mode='r')
+        features_da = da.from_zarr(feat_gt['features']).rechunk({0: chunk_size, 1: -1})
+        labels = feat_gt['labels'][:]
+        
+        train_mean = torch.from_numpy(checkpoint['train_mean']).float()
+        train_std = torch.from_numpy(checkpoint['train_std']).float()
+        latent_mean = torch.from_numpy(checkpoint['latent_mean']).float()
+        latent_std = torch.from_numpy(checkpoint['latent_std']).float()
+
+    except Exception as e:
+        logging.error(f"Failed to initialize: {e}")
+        raise
+
     n_samples = features_da.shape[0]
-    scores_ds = root.create_dataset('scores', 
-                                    shape=(n_samples, latent_dim), 
-                                    chunks=(chunk_size, latent_dim), 
-                                    dtype='f4', compressor=compressor)
-    
-    norm_scores_ds = root.create_dataset('normalized_scores', 
-                                         shape=(n_samples, latent_dim), 
-                                         chunks=(chunk_size, latent_dim), 
-                                         dtype='f4', compressor=compressor)
+    all_scores = []
+    all_normalized_scores = []
 
-    # 4. Stream Inference through the Encoder
+    # 3. Stream Inference
     logging.info("Streaming features through Encoder...")
     
     with torch.no_grad():
-        # Process in chunks to stay within memory limits
         for start in range(0, n_samples, chunk_size):
             end = min(start + chunk_size, n_samples)
             
-            # Get chunk and convert to torch
             chunk_np = features_da[start:end].compute()
             x = torch.from_numpy(chunk_np).float()
             
-            # Input Normalization (Standard for Deep Learning)
-            x_normalized = (x - train_mu) / (train_std + 1e-6)
+            # Input Normalization
+            x_normalized = (x - train_mean) / train_std
             
-            # Pass through Encoder only to get latent scores
+            # Forward pass
             z = model.encoder(x_normalized)
+            z_normalized = (z - latent_mean) / latent_std
             
-            # Calculate Normalized Scores (equivalent to PCA scores / sqrt(var))
-            z_norm = z / (latent_std + 1e-6)
-            
-            # Save back to Zarr
-            scores_ds[start:end] = z.numpy()
-            norm_scores_ds[start:end] = z_norm.numpy()
+            all_scores.append(z.numpy())
+            all_normalized_scores.append(z_normalized.numpy())
 
-    root.create_dataset('labels', data=labels)
-    logging.info(f"Finished. Scores saved to {output_zarr_path}")
+    # 4. Concatenate and Save to CSV
+    # Create column names for latent dimensions (e.g., PC1, PC2...)
+    col_names = [f"PC_{i+1}" for i in range(latent_dim)]
+    
+    # Process Raw Scores
+    df_scores = pd.DataFrame(np.vstack(all_scores), columns=col_names)
+    df_scores.insert(0, 'label', labels) # Add labels as first column
+    
+    # Process Normalized Scores
+    df_norm_scores = pd.DataFrame(np.vstack(all_normalized_scores), columns=col_names)
+    df_norm_scores.insert(0, 'label', labels)
+
+    # Save to csv 
+    df_scores.to_csv(scores_csv_path, index=False)
+    df_norm_scores.to_csv(normalized_scores_csv_path, index=False)
+
+    logging.info(f"Finished computing scores. Files saved to {os.path.dirname(scores_csv_path)} and {os.path.dirname(normalized_scores_csv_path)}")
     return True
 
 
+def deep_pca_performance(
+    model_pth_path: str = None, 
+    scores_csv_path: str = None, 
+    gt_features_zarr_path: str = None, 
+    marginal_mse_csv_path: str = None,
+    cumulative_mse_csv_path: str = None,
+    n_components: int = 25,
+) -> Tuple[np.ndarray, np.ndarray]:
+    
+    # 1. Load Model and Weights
+    try:
+        checkpoint = torch.load(model_pth_path, map_location='cpu')
+        input_dim = checkpoint['input_dim']
+        latent_dim = checkpoint['latent_dim']
+        
+        train_mean = checkpoint['train_mean'].astype(np.float32)
+        train_std = checkpoint['train_std'].astype(np.float32)
+        
+        model = OrderedAutoencoder(input_dim, latent_dim)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        # Ground truth remains in Zarr
+        feat_gt = zarr.open(gt_features_zarr_path, mode='r')
+    except Exception as e:
+        logging.error(f"Failed to initialize: {e}")
+        raise
 
-def deep_masks_from_scores_zarr(
-    mask_from_features,  # Your callback to invert polynomial -> 3D mask
-    model_pth_path: str,
-    scores_zarr_path: str,
-    output_zarr_path: str,
+    # 2. Load Scores CSV and Prepare Metadata
+    df_scores = pd.read_csv(scores_csv_path)
+    label_col = df_scores.columns[0]
+    
+    labels_scores = df_scores[label_col].astype(str).tolist()
+    scores_matrix = df_scores.iloc[:, 1:].values.astype('float32')
+    
+    labels_orig = [str(l) for l in feat_gt['labels'][:]]
+    orig_label_to_idx = {l: i for i, l in enumerate(labels_orig)}
+    
+    n_samples = len(labels_scores)
+    cumulative_mse = np.zeros((n_samples, n_components), dtype=np.float32)
+    marginal_mse = np.zeros((n_samples, n_components), dtype=np.float32)
+
+    train_mean_norm = np.linalg.norm(train_mean)
+
+    logging.info(f"Starting Deep PCA performance evaluation for {n_samples} samples.")
+    
+    # 3. Evaluation Loop
+    with torch.no_grad():
+        for i, label in enumerate(tqdm(labels_scores, desc="Subjects")):
+            if label not in orig_label_to_idx:
+                logging.warning(f"Label {label} missing in ground truth Zarr. Skipping.")
+                continue
+                
+            orig_idx = orig_label_to_idx[label]
+            orig_features = feat_gt['features'][orig_idx]
+            
+            # Extract scores for this subject
+            subject_scores = scores_matrix[i, :]
+            scores_tensor = torch.from_numpy(subject_scores).float().unsqueeze(0)
+             
+            for k_idx in range(n_components):
+                # --- Marginal Reconstruction (Effect of exactly the k-th component) ---
+                mask_m = torch.zeros_like(scores_tensor)
+                mask_m[0, k_idx] = 1.0
+                recon_norm_m = model.decoder(scores_tensor * mask_m).numpy().squeeze()
+                recon_raw_m = (recon_norm_m * train_std) + train_mean
+                marginal_mse[i, k_idx] = np.linalg.norm(recon_raw_m - orig_features) / train_mean_norm
+
+                # --- Cumulative Reconstruction (Effect of components 0 through k) ---
+                mask_c = torch.zeros_like(scores_tensor)
+                mask_c[0, :k_idx + 1] = 1.0  # +1 to include the k-th component
+                recon_norm_c = model.decoder(scores_tensor * mask_c).numpy().squeeze()
+                recon_raw_c = (recon_norm_c * train_std) + train_mean
+                cumulative_mse[i, k_idx] = np.linalg.norm(recon_raw_c - orig_features) / train_mean_norm
+        
+        # 4. Save Results
+        pd.DataFrame(cumulative_mse, index=labels_scores).to_csv(cumulative_mse_csv_path)
+        pd.DataFrame(marginal_mse, index=labels_scores).to_csv(marginal_mse_csv_path)
+
+    logging.info("Performance evaluation complete.")
+    return cumulative_mse, marginal_mse
+
+
+
+def deep_cumulative_features_from_scores(
+    model_pth_path: str = None, 
+    scores_csv_path: str = None,
+    gt_features_zarr_path: str = None,
+    output_zarr_path: str = None,
     target_labels: list = None,
-    num_components: int = None, # Equivalent to 'components' list in PCA
+    step_size: int = 1,
+    max_components: int = 10, 
+):
+    """
+    Cumulative reconstruction from CSV scores with target label filtering.
+    Output Zarr shape: (n_samples, n_steps, n_features)
+    Steps: [Decoded Mean, Step_1, ..., Step_N, Ground Truth]
+    """
+    # 1. Load Model and Normalization Constants
+    try:
+        checkpoint = torch.load(model_pth_path, map_location='cpu')
+        input_dim = checkpoint['input_dim']
+        latent_dim = checkpoint['latent_dim']
+        
+        train_mean = checkpoint['train_mean'].astype(np.float32)
+        train_std = checkpoint['train_std'].astype(np.float32)
+        latent_mean = torch.from_numpy(checkpoint['latent_mean']).float().view(1, -1)
+        
+        model = OrderedAutoencoder(input_dim, latent_dim)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        feat_gt = zarr.open(gt_features_zarr_path, mode='r')
+    except Exception as e:
+        logging.error(f"Initialization failed: {e}")
+        raise
+
+    # 2. Load and Filter CSV Data
+    df = pd.read_csv(scores_csv_path)
+    label_col = df.columns[0]
+
+    if target_labels is not None:
+        # Filter dataframe to only include target_labels
+        target_str = [str(l) for l in target_labels]
+        df = df[df[label_col].astype(str).isin(target_str)]
+
+    if df.empty:
+        logging.error("No matching labels found in CSV. check target_labels.")
+        return False
+
+    found_labels = df[label_col].astype(str).tolist()
+    scores_matrix = df.iloc[:, 1:].values.astype('float32')
+    
+    # Map labels to Zarr indices for GT lookup
+    labels_orig = [str(l) for l in feat_gt['labels'][:]]
+    orig_label_to_idx = {l: i for i, l in enumerate(labels_orig)}
+
+    n_samples = len(found_labels)
+    save_indices = np.arange(step_size - 1, max_components, step_size)
+    
+    n_steps = len(save_indices) + 2 
+    step_names = ["Mean"] + (save_indices + 1).tolist() + ["GT"]
+
+    # 3. Setup Output Store
+    root = zarr.open(output_zarr_path, mode='w')
+    root.attrs['saved_steps'] = step_names
+    root.create_dataset('labels', data=np.array(found_labels, dtype='U'), overwrite=True)
+
+    # Copy metadata
+    root.attrs['original_shape'] = checkpoint['original_shape']
+    root.attrs['kwargs'] = checkpoint['kwargs']
+    
+    z_recons = root.create_dataset(
+        'features',
+        shape=(n_samples, n_steps, input_dim),
+        chunks=(1, 1, input_dim),
+        dtype='float32',
+        compressor=zarr.Blosc(cname='zstd', clevel=3)
+    )
+
+    # 4. Pre-compute decoded mean
+    with torch.no_grad():
+        mean_recon_norm = model.decoder(latent_mean).numpy().squeeze()
+        decoded_mean_shape = (mean_recon_norm * train_std) + train_mean
+
+    # 5. Loop
+    logging.info(f"Reconstructing {n_samples} filtered samples.")
+
+    with torch.no_grad():
+        for i, label in enumerate(tqdm(found_labels, desc="Cumulative Steps")):
+            # Step 0: Decoded Mean
+            z_recons[i, 0, :] = decoded_mean_shape
+            
+            # Step -1: Ground Truth
+            if label in orig_label_to_idx:
+                gt_idx = orig_label_to_idx[label]
+                z_recons[i, -1, :] = feat_gt['features'][gt_idx].astype(np.float32)
+            
+            # Intermediate Steps
+            subject_scores = scores_matrix[i, :]
+            scores_tensor = torch.from_numpy(subject_scores).float().unsqueeze(0)
+            
+            step_counter = 1 
+            for k_idx in range(max_components):
+                if k_idx in save_indices:
+                    mask = torch.zeros_like(scores_tensor)
+                    mask[0, :k_idx + 1] = 1.0
+                    
+                    recon_norm = model.decoder(scores_tensor * mask).numpy().squeeze()
+                    recon_raw = (recon_norm * train_std) + train_mean
+                    
+                    z_recons[i, step_counter, :] = recon_raw
+                    step_counter += 1
+
+    logging.info("Deep cumulative reconstruction finished.")
+    return True
+
+
+# def deep_cumulative_features_from_scores(
+#     model_checkpoint_path: str, 
+#     scores_zarr_path: str,
+#     features_zarr_path: str,
+#     output_zarr_path: str,
+#     target_labels: list = None,
+#     step_size: int = 1,
+#     max_components: int = 10, 
+# ):
+#     # 1. Load Model and Normalization Constants
+#     try:
+#         checkpoint = torch.load(model_checkpoint_path, map_location='cpu')
+#         input_dim = checkpoint['input_dim']
+#         latent_dim = checkpoint['latent_dim']
+        
+#         train_mean = checkpoint['train_mean'].astype(np.float32)
+#         train_std = checkpoint['train_std'].astype(np.float32)
+        
+#         # Load latent mean to compute the "Decoded Mean Shape"
+#         latent_mean = torch.from_numpy(checkpoint['latent_mean']).float().view(1, -1)
+        
+#         model = OrderedAutoencoder(input_dim, latent_dim)
+#         model.load_state_dict(checkpoint['model_state_dict'])
+#         model.eval()
+        
+#         z_scores = zarr.open(scores_zarr_path, mode='r')
+#         feat_gt = zarr.open(features_zarr_path, mode='r')
+#     except Exception as e:
+#         logging.error(f"Initialization failed: {e}")
+#         raise
+
+#     # 2. Handle Labels and Indices
+#     all_labels = z_scores['labels'][:].astype(str)
+#     label_to_idx = {l: i for i, l in enumerate(all_labels)}
+    
+#     if target_labels is not None:
+#         valid_indices = [label_to_idx[str(l)] for l in target_labels if str(l) in label_to_idx]
+#         found_labels = [str(all_labels[idx]) for idx in valid_indices]
+#     else:
+#         valid_indices = list(range(len(all_labels)))
+#         found_labels = all_labels.tolist()
+
+#     n_samples = len(valid_indices)
+#     save_indices = np.arange(step_size - 1, max_components, step_size)
+    
+#     # Updated steps: [Mean, Step_1, ..., Step_N, GT]
+#     n_steps = len(save_indices) + 2 
+#     step_names = ["Mean"] + (save_indices + 1).tolist() + ["GT"]
+
+#     # 3. Setup Output Store
+#     root = zarr.open(output_zarr_path, mode='w')
+#     root.attrs['saved_steps'] = step_names
+#     root.create_dataset('labels', data=np.array(found_labels, dtype='U'), overwrite=True)
+    
+#     z_recons = root.create_dataset(
+#         'features',
+#         shape=(n_samples, n_steps, input_dim),
+#         chunks=(1, 1, input_dim),
+#         dtype='float32',
+#         compressor=zarr.Blosc(cname='zstd', clevel=3)
+#     )
+
+#     # 4. Pre-compute the decoded mean shape (Step 0)
+#     # This represents the "average" shape the model has learned.
+#     with torch.no_grad():
+#         mean_recon_norm = model.decoder(latent_mean).numpy().squeeze()
+#         decoded_mean_shape = (mean_recon_norm * train_std) + train_mean
+
+#     # 5. Cumulative Reconstruction Loop
+#     logging.info(f"Deep Reconstruction: {n_samples} samples, {n_steps} steps")
+
+#     with torch.no_grad():
+#         for i, idx in tqdm(enumerate(valid_indices), total=n_samples):
+#             raw_gt = feat_gt['features'][idx].astype(np.float32)
+            
+#             # --- Step 0: Save the Decoded Latent Mean ---
+#             z_recons[i, 0, :] = decoded_mean_shape
+            
+#             # --- Step -1: Save the Ground Truth ---
+#             z_recons[i, -1, :] = raw_gt
+            
+#             # --- Intermediate Steps ---
+#             subject_scores = z_scores['scores'][idx, :]
+#             scores_tensor = torch.from_numpy(subject_scores).float().unsqueeze(0)
+            
+#             # Start at index 1 because index 0 is the Mean
+#             step_counter = 1 
+#             for k_idx in range(max_components):
+#                 if k_idx in save_indices:
+#                     mask = torch.zeros_like(scores_tensor)
+#                     mask[0, :k_idx + 1] = 1.0
+                    
+#                     recon_norm = model.decoder(scores_tensor * mask).numpy().squeeze()
+#                     recon_raw = (recon_norm * train_std) + train_mean
+                    
+#                     z_recons[i, step_counter, :] = recon_raw
+#                     step_counter += 1
+
+#     # Copy metadata
+#     root.attrs['original_shape'] = z_scores.attrs.get('original_shape')
+#     root.attrs['kwargs'] = z_scores.attrs.get('kwargs')
+
+#     logging.info(f"Reconstruction complete.")
+
+
+
+
+def deep_features_from_scores(
+    model_pth_path: str = None,
+    scores_csv_path: str = None,
+    features_zarr_path: str = None,
+    n_components: int = None,
     chunk_size: int = 10
 ):
     """
-    Non-linear reconstruction:
-    Scores -> Decoder -> Polynomial Features -> 3D Mask
+    Reconstruct features using all absolute scores from a CSV file.
+    Assumes first column = labels, subsequent columns = latent scores.
     """
     # 1. Load Model and Metadata
     checkpoint = torch.load(model_pth_path)
@@ -277,116 +678,100 @@ def deep_masks_from_scores_zarr(
     # Load training stats for inverse scaling
     train_mu = torch.from_numpy(checkpoint['train_mean']).float()
     train_std = torch.from_numpy(checkpoint['train_std']).float()
+    n_features = checkpoint['input_dim']
 
-    z_scores = zarr.open(scores_zarr_path, mode='r')
-    shape = tuple(checkpoint['original_shape'])
-    kwargs = checkpoint.get('kwargs', {})
-
-    # Handle labels and indexing
-    all_labels = [str(l) for l in z_scores['labels'][:]]
-    label_to_idx = {l: i for i, l in enumerate(all_labels)}
+    # 2. Load CSV Data
+    df = pd.read_csv(scores_csv_path)
+    label_col = df.columns[0]
     
-    if target_labels is not None:
-        valid_indices = [label_to_idx[l] for l in target_labels if l in label_to_idx]
-        found_labels = [l for l in target_labels if l in label_to_idx]
-    else:
-        valid_indices = list(range(len(all_labels)))
-        found_labels = all_labels
+    found_labels = df[label_col].astype(str).tolist()
+    # Scores are everything except the first column
+    scores_matrix = df.iloc[:, 1:].values.astype('float32')
 
-    # 2. Setup Output Store
-    store = zarr.DirectoryStore(output_zarr_path)
+    # 3. Setup Output Store (Zarr)
+    store = zarr.DirectoryStore(features_zarr_path)
     root = zarr.group(store=store, overwrite=True)
+
     z_recons = root.create_dataset(
-        'reconstructed_masks',
-        shape=(len(valid_indices),) + shape,
-        chunks=(1,) + shape,
-        dtype=bool,
-        compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
+        'features',
+        shape=(len(found_labels), n_features),
+        chunks=(1, n_features),
+        dtype='float32',
+        compressor=zarr.Blosc(cname='zstd', clevel=3)
     )
     root.create_dataset('labels', data=found_labels)
 
-    # 3. Reconstruction Loop
-    logging.info(f"Reconstructing {len(valid_indices)} masks using {num_components or 'all'} components...")
+    # Copy metadata
+    root.attrs['original_shape'] = checkpoint['original_shape']
+    root.attrs['kwargs'] = checkpoint['kwargs']
+
+    # 4. Reconstruction Loop
+    logging.info(f"Reconstructing {len(found_labels)} samples from CSV...")
 
     with torch.no_grad():
-        for i, idx in enumerate(valid_indices):
-            # A. Get the latent score
-            score_np = z_scores['scores'][idx, :]
-            score_tensor = torch.from_numpy(score_np).float().unsqueeze(0) # (1, latent_dim)
+        for i in range(len(found_labels)):
+            # A. Get latent score
+            score_tensor = torch.from_numpy(scores_matrix[i]).float().unsqueeze(0)
 
-            # B. Apply "Low-Rank" Approximation
-            # We zero out all components beyond the requested number
-            if num_components is not None:
+            # B. Optional Low-Rank Approximation
+            if n_components is not None:
                 mask = torch.zeros_like(score_tensor)
-                mask[:, :num_components] = 1.0
+                mask[:, :n_components] = 1.0
                 score_tensor = score_tensor * mask
 
-            # C. Pass through Decoder (Non-linear projection)
-            # The decoder outputs normalized features
+            # C. Decode and Inverse Scale
             recon_features = model.decoder(score_tensor)
-
-            # D. Inverse Scaling (De-normalize to original polynomial scale)
-            # feat_vec = (normalized * std) + mu
             feat_vec = (recon_features * train_std) + train_mu
-            feat_vec_np = feat_vec.squeeze().numpy()
-
-            # E. Generate 3D volume via your SDT-inverse function
-            mask_3d = mask_from_features(feat_vec_np, shape, **kwargs)
-            z_recons[i, ...] = mask_3d.astype(bool)
+            
+            # D. Save result
+            z_recons[i] = feat_vec.squeeze().numpy()
 
             if (i + 1) % chunk_size == 0:
-                logging.info(f"Progress: {i+1}/{len(valid_indices)} completed.")
+                logging.info(f"Progress: {i+1}/{len(found_labels)} completed.")
 
     logging.info("Deep reconstruction finished.")
     return True
 
 
 
-def deep_modes_from_pca_zarr(
-    mask_from_features, 
-    model_pth_path: str, 
-    modes_zarr_path: str, 
-    n_components=8, 
-    n_coeffs=11, 
-    max_coeff=10  # Typically 2 or 3 standard deviations
+def deep_modes_from_pca( 
+    model_pth_path: str = None, 
+    modes_zarr_path: str = None, 
+    n_components: int = 8, 
+    n_coeffs: int = 11, 
+    max_coeff: float = 5  # Typically 2 or 3 standard deviations
 ):
     """
     Generates 3D shape modes by traversing the latent space of the Autoencoder.
     Output: 5D Zarr (Coeff_Steps, Mode_Index, Depth, Height, Width)
     """
     # 1. Load Model and Stats
-    checkpoint = torch.load(model_pth_path)
-    model = OrderedAutoencoder(checkpoint['input_dim'], checkpoint['latent_dim'])
+    checkpoint = torch.load(model_pth_path, map_location='cpu')
+    n_features= checkpoint['input_dim']
+    latent_dim = checkpoint['latent_dim']
+
+    model = OrderedAutoencoder(n_features, latent_dim)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
     # Feature scaling parameters
     train_mu = torch.from_numpy(checkpoint['train_mean']).float()
     train_std = torch.from_numpy(checkpoint['train_std']).float()
-    
-    # Latent scaling (Standard Deviation of the scores)
-    # This is equivalent to 'sdev' in your linear PCA version
     latent_sdev = torch.from_numpy(checkpoint['latent_std']).float()
+    latent_mean = torch.from_numpy(checkpoint['latent_mean']).float()
 
-    shape = tuple(checkpoint['original_shape'])
-    kwargs = checkpoint.get('kwargs', {})
     limit_k = min(n_components, checkpoint['latent_dim'])
-
-    # 2. Setup Step Coefficients (e.g., -3 sigma to +3 sigma)
     coeffs_range = np.linspace(-max_coeff, max_coeff, n_coeffs)
 
-    # 3. Setup 5D Output Store
+    # 3. Setup Output Store
     store = zarr.DirectoryStore(modes_zarr_path)
     root = zarr.group(store=store, overwrite=True)
     
-    out_shape = (n_coeffs, limit_k) + shape
-    chunks = (1, 1) + shape 
-    
     z_modes = root.create_dataset(
-        'modes',
-        shape=out_shape,
-        chunks=chunks,
-        dtype=bool,
+        'features',
+        shape=(n_coeffs, limit_k, n_features),
+        chunks=(1, 1, n_features),
+        dtype='float32',
         compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
     )
     
@@ -400,23 +785,22 @@ def deep_modes_from_pca_zarr(
         for i in tqdm(range(limit_k), desc="Processing Modes"):
             for j in range(n_coeffs):
                 # Start with a "Zero" latent vector (the mean shape)
-                z = torch.zeros((1, checkpoint['latent_dim']))
+                # z = torch.zeros((1, checkpoint['latent_dim']))
+                # Start with the global latent mean
+                z = latent_mean.clone().unsqueeze(0)
                 
                 # Vary only the i-th component
-                # Formula: Score = step_coefficient * standard_deviation_of_component
-                z[0, i] = coeffs_range[j] * latent_sdev[i]
+                # Formula: Score = step_coefficient * standard_deviation_of_component + mean_of_component
+                z[0, i] = (coeffs_range[j] * latent_sdev[i]) + latent_mean[i]
 
-                # Decode to normalized polynomial features
+                # Decode and unnormalize
                 recon_normalized = model.decoder(z)
-
-                # Inverse scale to original polynomial units
                 feat_vec = (recon_normalized * train_std) + train_mu
-                feat_vec_np = feat_vec.squeeze().numpy()
 
-                # Reconstruct the 3D volume
-                mask_3d = mask_from_features(feat_vec_np, shape, **kwargs)
-                
-                z_modes[j, i, ...] = mask_3d.astype(bool)
+                z_modes[j, i, :] = feat_vec.cpu().numpy().flatten()
+
+    # Copy essential attributes for reconstruction
+    root.attrs['original_shape'] = checkpoint['original_shape']
+    root.attrs['kwargs'] = checkpoint['kwargs']
 
     logging.info(f"Deep Modes: Successfully saved to {modes_zarr_path}")
-    return True

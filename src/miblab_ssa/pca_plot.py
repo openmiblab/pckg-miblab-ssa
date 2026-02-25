@@ -2,11 +2,33 @@ import numpy as np
 import zarr
 import matplotlib.pyplot as plt
 import pandas as pd
+import torch
+from PIL import Image
+import os
+import seaborn as sns
+import glob
+
+
+def plot_deep_pca_performance(
+    model_pth_path: str = None, 
+    output_image_path: str = None,
+    marginal_mse_path: str = None, 
+    cumulative_mse_path: str = None, 
+    n_components: int = None
+):
+    # 1. Load Variance Data
+    checkpoint = torch.load(model_pth_path, map_location='cpu')
+    latent_std = checkpoint['latent_std'][:]
+    variance = latent_std ** 2
+    var_ratio = variance / np.sum(variance)
+
+    # 2. Create plot
+    _plot_pca_performance(var_ratio, output_image_path, marginal_mse_path, cumulative_mse_path, n_components)
 
 
 def plot_pca_performance(
-    pca_zarr_path: str, 
-    output_image_path: str,
+    pca_zarr_path: str = None, 
+    output_image_path: str = None,
     marginal_mse_path: str = None, 
     cumulative_mse_path: str = None, 
     n_components: int = None
@@ -14,6 +36,12 @@ def plot_pca_performance(
     # 1. Load Variance Data
     z_pca = zarr.open(pca_zarr_path, mode='r')
     var_ratio = z_pca['variance_ratio'][:] 
+
+    # 2. Create plot
+    _plot_pca_performance(var_ratio, output_image_path, marginal_mse_path, cumulative_mse_path, n_components)
+
+
+def _plot_pca_performance(var_ratio, output_image_path, marginal_mse_path, cumulative_mse_path, n_components):
     limit = n_components if n_components else var_ratio.size
     var_ratio = var_ratio[:limit]
     cum_var_ratio = np.cumsum(var_ratio)
@@ -98,3 +126,277 @@ def plot_pca_performance(
     plt.savefig(output_image_path, dpi=300)
     plt.show()
     plt.close()
+
+
+def plot_pca_reconstruction_performance(
+    dice_csv_path: str = None, 
+    hausdorff_csv_path: str = None, 
+    output_image_path: str = None
+):
+    """
+    Updated to handle the "Mean" index at index 0 and "GT" at the end.
+    Produces side-by-side plots for Dice-based Error and Hausdorff Distance.
+    """
+    # 1. Load Data
+    df_dice = pd.read_csv(dice_csv_path, index_col=0)
+    df_haus = pd.read_csv(hausdorff_csv_path, index_col=0)
+
+    # 2. Filter Logic: 
+    # We want to plot everything except the "GT" column (which is just zero error).
+    def get_plot_data(df):
+        # Keeps "Mean" and numeric steps, drops "GT"
+        valid_cols = [c for c in df.columns if str(c).upper() != 'GT']
+        return df[valid_cols], valid_cols
+
+    df_dice_plot, steps = get_plot_data(df_dice)
+    df_haus_plot, _ = get_plot_data(df_haus)
+    
+    # x_numeric will be 0 (Mean), 1 (First K), 2 (Second K), etc.
+    x_numeric = np.arange(len(steps))
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    plt.subplots_adjust(wspace=0.25)
+
+    # --- PLOTTING HELPER ---
+    def render_panel(ax, df, title, ylabel, color, line_color):
+        median = df.median(axis=0)
+        q1 = df.quantile(0.25, axis=0)
+        q3 = df.quantile(0.75, axis=0)
+        d_min = df.min(axis=0)
+        d_max = df.max(axis=0)
+        
+        # Area shading
+        ax.fill_between(x_numeric, d_min, d_max, color='gray', alpha=0.1, label='Min-Max Range')
+        ax.fill_between(x_numeric, q1, q3, color=color, alpha=0.3, label='IQR (25th-75th)')
+        
+        # Median line
+        ax.plot(x_numeric, median, color=line_color, alpha=0.9, linestyle='-', lw=2.5, zorder=4)
+        ax.scatter(x_numeric, median, color=line_color, s=60, label='Median', edgecolors='white', zorder=5)
+        
+        # Aesthetics
+        ax.set_title(title, fontsize=15, fontweight='bold', pad=15)
+        ax.set_ylabel(ylabel, fontsize=12, fontweight='semibold')
+        ax.set_xlabel("Reconstruction Progress (Components)", fontsize=12)
+        
+        # Set ticks and labels (handles "Mean" string and numeric steps)
+        ax.set_xticks(x_numeric)
+        ax.set_xticklabels(steps, rotation=0)
+        
+        ax.set_ylim(0, df.values.max() * 1.15)
+        ax.grid(axis='y', linestyle='--', alpha=0.3)
+        ax.legend(loc='upper right', fontsize='small', frameon=True)
+
+    # --- Panel 1: Dice Error ---
+    render_panel(
+        axes[0], df_dice_plot, 
+        "Overlap Accuracy (1 - Dice)", 
+        "Error (Lower is Better)",
+        color='lightskyblue', line_color='steelblue'
+    )
+
+    # --- Panel 2: Hausdorff Distance ---
+    render_panel(
+        axes[1], df_haus_plot, 
+        "Boundary Accuracy (Hausdorff)", 
+        "Distance (mm)",
+        color='mediumpurple', line_color='indigo'
+    )
+
+    plt.tight_layout()
+    plt.savefig(output_image_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close()
+
+    return True
+
+
+
+
+def plot_reconstruction_fidelity(
+    dice_csv_path: str = None,
+    hausdorff_csv_path: str = None,
+    output_image_path: str = None,
+):
+    """
+    Plots the distribution of reconstruction accuracy across spectral orders.
+    Calculates 1 - Dice for the error plot to show convergence toward zero.
+    """
+    # 1. Load Data
+    df_dice = pd.read_csv(dice_csv_path, index_col=0)
+    df_haus = pd.read_csv(hausdorff_csv_path, index_col=0)
+    
+    # If Dice is provided, convert to Error (1 - Dice)
+    df_dice_error = 1 - df_dice
+
+    # 2. Setup Plotting Grid
+    ncols = 2
+    fig, axes = plt.subplots(1, ncols, figsize=(8 * ncols, 7))
+
+    # --- PLOTTING HELPER ---
+    def render_panel(ax, df, title, ylabel, color, line_color):
+        # Ensure columns are sorted numerically (1, 2, 3...)
+        cols = sorted(df.columns, key=lambda x: int(x) if str(x).isdigit() else 0)
+        df_plot = df[cols]
+        
+        x_numeric = np.arange(len(cols))
+        
+        median = df_plot.median(axis=0)
+        q1 = df_plot.quantile(0.25, axis=0)
+        q3 = df_plot.quantile(0.75, axis=0)
+        d_min = df_plot.min(axis=0)
+        d_max = df_plot.max(axis=0)
+        
+        # Area shading
+        ax.fill_between(x_numeric, d_min, d_max, color='gray', alpha=0.1, label='Min-Max Range')
+        ax.fill_between(x_numeric, q1, q3, color=color, alpha=0.3, label='IQR (25th-75th)')
+        
+        # Median line
+        ax.plot(x_numeric, median, color=line_color, alpha=0.9, lw=2.5, zorder=4)
+        ax.scatter(x_numeric, median, color=line_color, s=40, label='Median', edgecolors='white', zorder=5)
+        
+        # Aesthetics
+        ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
+        ax.set_ylabel(ylabel, fontsize=11, fontweight='semibold')
+        ax.set_xlabel("Spectral Reconstruction Order", fontsize=11)
+        
+        # Thinned out X-labels for 1-36 range (show every 5th order)
+        ax.set_xticks(x_numeric[::5])
+        ax.set_xticklabels(cols[::5])
+        
+        ax.set_ylim(0, df_plot.values.max() * 1.1)
+        ax.grid(axis='y', linestyle='--', alpha=0.3)
+        ax.legend(loc='upper right', fontsize='small')
+        sns.despine(ax=ax)
+
+    # --- Panel 1: Dice Error ---
+    render_panel(
+        axes[0], df_dice_error, 
+        "Spectral Convergence (Overlap)", 
+        "1 - Dice Score (Lower is Better)",
+        color='lightskyblue', line_color='steelblue'
+    )
+
+    # --- Panel 2: Hausdorff (Optional) ---
+    render_panel(
+        axes[1], df_haus, 
+        "Boundary Convergence (Distance)", 
+        "Hausdorff Distance (mm)",
+        color='mediumpurple', line_color='indigo'
+    )
+
+    plt.tight_layout()
+    plt.savefig(output_image_path, dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+
+def plot_mask_sections(
+    dataset_zarr_path: str = None, 
+    dir_png: str = None,
+):
+    # 1. Load the dataset
+    # Expected shape: (n_cols, n_rows, x, y, z)
+    root = zarr.open(dataset_zarr_path, mode='r')
+    data = root['masks']
+    n_cols, n_rows, sx, sy, sz = data.shape
+    
+    centers = (sx // 2, sy // 2, sz // 2)
+    os.makedirs(dir_png, exist_ok=True)
+
+    # Define the planes to extract
+    # Mapping plane name to the slicing logic
+    planes = {
+        "axial":     lambda d: d[:, :, :, :, centers[2]],  # (C, R, X, Y)
+        "sagittal":  lambda d: d[:, :, :, centers[1], :].transpose(0, 1, 3, 2),  # (C, R, X, Z)
+        "coronal":   lambda d: d[:, :, centers[0], :, :].transpose(0, 1, 3, 2),  # (C, R, Y, Z)
+    }
+
+    for name, slice_func in planes.items():
+        # Extract the 4D grid of 2D slices
+        grid_4d = slice_func(data) 
+        
+        # 2. Arrange into a 2D Mosaic
+        # np.block expects a list of lists: [[row1_img1, row1_img2], [row2_img1...]]
+        # We iterate rows first, then columns
+        rows_list = []
+        for r in range(n_rows):
+            cols_list = [grid_4d[c, r] for c in range(n_cols)]
+            rows_list.append(cols_list)
+        
+        mosaic = np.block(rows_list)
+        
+        # 3. Convert to Image
+        mosaic = (mosaic * 255).astype(np.uint8)
+            
+        img = Image.fromarray(mosaic)
+        img.save(os.path.join(dir_png, f"mosaic_{name}.png"))
+        print(f"Saved {name} mosaic to {dir_png}")
+
+
+
+
+def plot_shape_fingerprints(
+    dir_csv: str = None, 
+    dir_png: str = None,
+):
+    """
+    Reads all shape CSVs and creates a vertical stack of 'fingerprint' plots for each.
+    The y-axis range is fixed across all rows within a feature to the global min-max.
+    """
+    os.makedirs(dir_png, exist_ok=True)
+    csv_files = glob.glob(os.path.join(dir_csv, "*.csv"))
+
+    for csv_path in csv_files:
+        feat_name = os.path.basename(csv_path).replace(".csv", "")
+        df = pd.read_csv(csv_path, index_col=0) 
+        
+        # Calculate global bounds for this specific feature
+        y_min = df.values.min()
+        y_max = df.values.max()
+        
+        # Add a small margin so the peaks/valleys don't touch the edges
+        margin = (y_max - y_min) * 0.05
+        y_lims = (y_min - margin, y_max + margin)
+
+        n_rows = len(df)
+        fig, axes = plt.subplots(
+            nrows=n_rows, 
+            ncols=1, 
+            figsize=(12, 1.2 * n_rows), # Slightly tighter height
+            sharex=True
+        )
+        
+        if n_rows == 1:
+            axes = [axes]
+            
+        for i, (idx, row_data) in enumerate(df.iterrows()):
+            ax = axes[i]
+            
+            x_vals = range(len(row_data))
+            y_vals = row_data.values
+            
+            # Plot fingerprint
+            ax.fill_between(x_vals, y_vals, alpha=0.3, color='teal')
+            ax.plot(x_vals, y_vals, color='teal', lw=1.5)
+            
+            # Fix the scale to the global range
+            ax.set_ylim(y_lims)
+            
+            # Formatting
+            ax.set_ylabel(f"Row {idx}", rotation=0, labelpad=40, va='center')
+            ax.set_yticks([])  
+            
+            # Remove top, right, and left spines
+            sns.despine(ax=ax, left=True)
+
+        # Only label the bottom x-axis
+        plt.xticks(range(len(df.columns)), df.columns, rotation=45, ha='right', fontsize=8)
+        
+        fig.suptitle(f"Shape Fingerprints: {feat_name}", fontsize=16, y=1.02)
+        plt.tight_layout()
+        
+        save_path = os.path.join(dir_png, f"{feat_name}.png")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+    print(f"Fingerprint plots saved to {dir_png}")
