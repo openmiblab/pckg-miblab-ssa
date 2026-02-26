@@ -177,7 +177,7 @@ def add_deep_pca_from_mask_metrics(
     eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     # 2. Load Model Checkpoint
-    checkpoint = torch.load(model_pth_path, map_location=device)
+    checkpoint = torch.load(model_pth_path, map_location=device, weights_only=False)
     latent_dim = checkpoint['latent_dim']
     
     model = HierarchicalOrderedAutoencoder(latent_dim=latent_dim).to(device)

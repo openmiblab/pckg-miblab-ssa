@@ -17,7 +17,7 @@ def plot_deep_pca_performance(
     n_components: int = None
 ):
     # 1. Load Variance Data
-    checkpoint = torch.load(model_pth_path, map_location='cpu')
+    checkpoint = torch.load(model_pth_path, map_location='cpu', weights_only=False)
     latent_std = checkpoint['latent_std'][:]
     variance = latent_std ** 2
     var_ratio = variance / np.sum(variance)

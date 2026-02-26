@@ -241,7 +241,7 @@ def add_deep_pca_metrics(
     logging.info(f"Connecting to {features_zarr_path}...")
     dataset = ZarrStreamingDataset(features_zarr_path)
 
-    checkpoint = torch.load(model_pth_path)
+    checkpoint = torch.load(model_pth_path, weights_only=False)
     input_dim = checkpoint['input_dim']
     latent_dim = checkpoint['latent_dim']
     
@@ -287,7 +287,7 @@ def deep_scores_from_features(
 
     try:
         # 1. Load the trained model and parameters
-        checkpoint = torch.load(model_pth_path)
+        checkpoint = torch.load(model_pth_path, weights_only=False)
         input_dim = checkpoint['input_dim']
         latent_dim = checkpoint['latent_dim']
 
@@ -364,7 +364,7 @@ def deep_pca_performance(
     
     # 1. Load Model and Weights
     try:
-        checkpoint = torch.load(model_pth_path, map_location='cpu')
+        checkpoint = torch.load(model_pth_path, map_location='cpu', weights_only=False)
         input_dim = checkpoint['input_dim']
         latent_dim = checkpoint['latent_dim']
         
@@ -453,7 +453,7 @@ def deep_cumulative_features_from_scores(
     """
     # 1. Load Model and Normalization Constants
     try:
-        checkpoint = torch.load(model_pth_path, map_location='cpu')
+        checkpoint = torch.load(model_pth_path, map_location='cpu', weights_only=False)
         input_dim = checkpoint['input_dim']
         latent_dim = checkpoint['latent_dim']
         
@@ -562,7 +562,7 @@ def deep_cumulative_features_from_scores(
 # ):
 #     # 1. Load Model and Normalization Constants
 #     try:
-#         checkpoint = torch.load(model_checkpoint_path, map_location='cpu')
+#         checkpoint = torch.load(model_checkpoint_path, map_location='cpu', weights_only=False)
 #         input_dim = checkpoint['input_dim']
 #         latent_dim = checkpoint['latent_dim']
         
@@ -670,7 +670,7 @@ def deep_features_from_scores(
     Assumes first column = labels, subsequent columns = latent scores.
     """
     # 1. Load Model and Metadata
-    checkpoint = torch.load(model_pth_path)
+    checkpoint = torch.load(model_pth_path, weights_only=False)
     model = OrderedAutoencoder(checkpoint['input_dim'], checkpoint['latent_dim'])
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
@@ -746,7 +746,7 @@ def deep_modes_from_pca(
     Output: 5D Zarr (Coeff_Steps, Mode_Index, Depth, Height, Width)
     """
     # 1. Load Model and Stats
-    checkpoint = torch.load(model_pth_path, map_location='cpu')
+    checkpoint = torch.load(model_pth_path, map_location='cpu', weights_only=False)
     n_features= checkpoint['input_dim']
     latent_dim = checkpoint['latent_dim']
 
