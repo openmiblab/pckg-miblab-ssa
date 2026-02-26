@@ -6,7 +6,7 @@ requires = ['setuptools>=61.2']
 
 [project]
 name = "miblab-ssa"
-version = "0.0.23"
+version = "0.0.24"
 dependencies = [
   'tqdm',
   'numpy',
@@ -22,6 +22,8 @@ dependencies = [
   'vreg',
   'torch',
   'pandas',
+  'seaborn',
+  'glob',
 ]
 # optional information
 description = "Statistical shape analysis for medical imaging"
