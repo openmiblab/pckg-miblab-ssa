@@ -56,11 +56,24 @@ def reconstruction_fidelity(
 
     # 2. Parallel Processing
     print(f"Evaluating reconstruction fidelity for {n_samples} samples up to order {max_order}...")
+
+    with tqdm(total=n_samples, desc="Processing Samples") as pbar:
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(_process_sample_orders)(
+                smooth_mask_func, 
+                dataset_zarr_path, 
+                i, 
+                min_order, 
+                max_order, 
+                deepcopy(kwargs)
+            )
+            for i in range(n_samples)
+        )
     
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(_process_sample_orders)(smooth_mask_func, dataset_zarr_path, i, min_order, max_order, deepcopy(kwargs))
-        for i in tqdm(range(n_samples))
-    )
+    # results = Parallel(n_jobs=n_jobs)(
+    #     delayed(_process_sample_orders)(smooth_mask_func, dataset_zarr_path, i, min_order, max_order, deepcopy(kwargs))
+    #     for i in tqdm(range(n_samples))
+    # )
 
     # 3. Aggregate results into matrices
     # We only need (max_order - min_order + 1) columns
