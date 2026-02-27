@@ -6,7 +6,7 @@ requires = ['setuptools>=61.2']
 
 [project]
 name = "miblab-ssa"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
   'tqdm',
   'numpy',

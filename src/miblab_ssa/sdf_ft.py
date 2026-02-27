@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, label
 from scipy.fft import dctn, idctn  
 
 
@@ -157,8 +157,18 @@ def mask_from_features(coeffs_flat: np.ndarray, shape, order, norm="ortho"):
 
     # 4. Inverse DCT
     sdf_recon = idctn(full_coeffs, norm=norm, workers=1)
+    sdf_recon = sdf_recon < 0
+
+    # POST-PROCESS: Keep only the largest component (The Kidney)
+    if np.any(sdf_recon):
+        labeled, num_features = label(sdf_recon)
+        if num_features > 1:
+            # Sort components by size
+            sizes = np.bincount(labeled.ravel())
+            largest_label = sizes[1:].argmax() + 1
+            sdf_recon = (labeled == largest_label)
     
-    return sdf_recon < 0
+    return sdf_recon
 
 
 def smooth_mask(mask:np.ndarray, order=16, norm="ortho"):
