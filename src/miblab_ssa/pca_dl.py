@@ -86,11 +86,11 @@ class ZarrStreamingDataset(Dataset):
         return torch.from_numpy(normalized)
     
 def deep_pca_from_features(
-    features_zarr_path=None, 
-    model_pth_path=None,
-    n_components=25, 
-    epochs=100, 
-    batch_size=64
+    features_zarr_path: str = None, 
+    model_pth_path: str = None,
+    n_components: int = 25, 
+    epochs: int = 100, 
+    batch_size: int = 64,
 ):
     # 1. Setup Lazy Loading
     logging.info(f"Connecting to {features_zarr_path}...")
@@ -273,11 +273,11 @@ def add_deep_pca_metrics(
 
 
 def deep_scores_from_features(
-    features_zarr_path:str=None, 
-    model_pth_path:str=None, 
-    scores_csv_path:str=None,
-    normalized_scores_csv_path:str = None, 
-    chunk_size=100
+    features_zarr_path: str = None, 
+    model_pth_path: str = None, 
+    scores_csv_path: str = None,
+    normalized_scores_csv_path: str = None, 
+    chunk_size = 100
 ):
     """
     Passes unseen features through the trained Encoder and saves 
@@ -452,71 +452,69 @@ def deep_cumulative_features_from_scores(
     Steps: [Decoded Mean, Step_1, ..., Step_N, Ground Truth]
     """
     # 1. Load Model and Normalization Constants
-    try:
-        checkpoint = torch.load(model_pth_path, map_location='cpu', weights_only=False)
-        input_dim = checkpoint['input_dim']
-        latent_dim = checkpoint['latent_dim']
-        
-        train_mean = checkpoint['train_mean'].astype(np.float32)
-        train_std = checkpoint['train_std'].astype(np.float32)
-        latent_mean = torch.from_numpy(checkpoint['latent_mean']).float().view(1, -1)
-        
-        model = OrderedAutoencoder(input_dim, latent_dim)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-        
-        feat_gt = zarr.open(gt_features_zarr_path, mode='r')
-    except Exception as e:
-        logging.error(f"Initialization failed: {e}")
-        raise
+    checkpoint = torch.load(model_pth_path, map_location='cpu', weights_only=False)
+    n_features = checkpoint['input_dim']
+    latent_dim = checkpoint['latent_dim']
+    
+    # Ensure these are tensors for easy math later
+    train_mean = torch.from_numpy(checkpoint['train_mean']).float()
+    train_std = torch.from_numpy(checkpoint['train_std']).float()
+    latent_mean = torch.from_numpy(checkpoint['latent_mean']).float().view(1, -1)
+    
+    model = OrderedAutoencoder(n_features, latent_dim)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    
+    feat_gt = zarr.open(gt_features_zarr_path, mode='r')
 
     # 2. Load and Filter CSV Data
     df = pd.read_csv(scores_csv_path)
     label_col = df.columns[0]
+    # Identify score columns explicitly
+    pc_cols = [c for c in df.columns if 'PC' in c or 'score' in c.lower()][:latent_dim]
 
+    # Sync with GT Zarr labels
+    labels_orig_map = {str(l): i for i, l in enumerate(feat_gt['labels'][:])}
+
+    # Filter for target labels AND existence in GT Zarr
     if target_labels is not None:
         # Filter dataframe to only include target_labels
         target_str = [str(l) for l in target_labels]
         df = df[df[label_col].astype(str).isin(target_str)]
+
+    df = df[df[label_col].astype(str).isin(labels_orig_map.keys())]
 
     if df.empty:
         logging.error("No matching labels found in CSV. check target_labels.")
         return False
 
     found_labels = df[label_col].astype(str).tolist()
-    scores_matrix = df.iloc[:, 1:].values.astype('float32')
-    
-    # Map labels to Zarr indices for GT lookup
-    labels_orig = [str(l) for l in feat_gt['labels'][:]]
-    orig_label_to_idx = {l: i for i, l in enumerate(labels_orig)}
+    scores_matrix = df[pc_cols].values[:, :latent_dim].astype('float32')
 
     n_samples = len(found_labels)
     save_indices = np.arange(step_size - 1, max_components, step_size)
-    
     n_steps = len(save_indices) + 2 
     step_names = ["Mean"] + (save_indices + 1).tolist() + ["GT"]
 
     # 3. Setup Output Store
     root = zarr.open(output_zarr_path, mode='w')
-    root.attrs['saved_steps'] = step_names
     root.create_dataset('labels', data=np.array(found_labels, dtype='U'), overwrite=True)
-
-    # Copy metadata
+    root.attrs['saved_steps'] = step_names
     root.attrs['original_shape'] = checkpoint['original_shape']
     root.attrs['kwargs'] = checkpoint['kwargs']
     
     z_recons = root.create_dataset(
         'features',
-        shape=(n_samples, n_steps, input_dim),
-        chunks=(1, 1, input_dim),
+        shape=(n_samples, n_steps, n_features),
+        chunks=(1, 1, n_features),
         dtype='float32',
         compressor=zarr.Blosc(cname='zstd', clevel=3)
     )
 
     # 4. Pre-compute decoded mean
     with torch.no_grad():
-        mean_recon_norm = model.decoder(latent_mean).numpy().squeeze()
-        decoded_mean_shape = (mean_recon_norm * train_std) + train_mean
+        mean_recon = model.decoder(latent_mean)
+        decoded_mean = (mean_recon * train_std + train_mean).numpy().squeeze()
 
     # 5. Loop
     logging.info(f"Reconstructing {n_samples} filtered samples.")
@@ -524,137 +522,28 @@ def deep_cumulative_features_from_scores(
     with torch.no_grad():
         for i, label in enumerate(tqdm(found_labels, desc="Cumulative Steps")):
             # Step 0: Decoded Mean
-            z_recons[i, 0, :] = decoded_mean_shape
+            z_recons[i, 0, :] = decoded_mean
             
             # Step -1: Ground Truth
-            if label in orig_label_to_idx:
-                gt_idx = orig_label_to_idx[label]
-                z_recons[i, -1, :] = feat_gt['features'][gt_idx].astype(np.float32)
+            gt_idx = labels_orig_map[label]
+            z_recons[i, -1, :] = feat_gt['features'][gt_idx]
             
             # Intermediate Steps
-            subject_scores = scores_matrix[i, :]
-            scores_tensor = torch.from_numpy(subject_scores).float().unsqueeze(0)
+            scores_tensor = torch.from_numpy(scores_matrix[i, :]).float().unsqueeze(0)
             
             step_counter = 1 
-            for k_idx in range(max_components):
-                if k_idx in save_indices:
-                    mask = torch.zeros_like(scores_tensor)
-                    mask[0, :k_idx + 1] = 1.0
-                    
-                    recon_norm = model.decoder(scores_tensor * mask).numpy().squeeze()
-                    recon_raw = (recon_norm * train_std) + train_mean
-                    
-                    z_recons[i, step_counter, :] = recon_raw
-                    step_counter += 1
+            for k in save_indices:
+                mask = torch.zeros_like(scores_tensor)
+                mask[0, :k + 1] = 1.0
+                
+                recon_norm = model.decoder(scores_tensor * mask)
+                recon_raw = (recon_norm * train_std + train_mean).numpy().squeeze()
+                
+                z_recons[i, step_counter, :] = recon_raw
+                step_counter += 1
 
     logging.info("Deep cumulative reconstruction finished.")
     return True
-
-
-# def deep_cumulative_features_from_scores(
-#     model_checkpoint_path: str, 
-#     scores_zarr_path: str,
-#     features_zarr_path: str,
-#     output_zarr_path: str,
-#     target_labels: list = None,
-#     step_size: int = 1,
-#     max_components: int = 10, 
-# ):
-#     # 1. Load Model and Normalization Constants
-#     try:
-#         checkpoint = torch.load(model_checkpoint_path, map_location='cpu', weights_only=False)
-#         input_dim = checkpoint['input_dim']
-#         latent_dim = checkpoint['latent_dim']
-        
-#         train_mean = checkpoint['train_mean'].astype(np.float32)
-#         train_std = checkpoint['train_std'].astype(np.float32)
-        
-#         # Load latent mean to compute the "Decoded Mean Shape"
-#         latent_mean = torch.from_numpy(checkpoint['latent_mean']).float().view(1, -1)
-        
-#         model = OrderedAutoencoder(input_dim, latent_dim)
-#         model.load_state_dict(checkpoint['model_state_dict'])
-#         model.eval()
-        
-#         z_scores = zarr.open(scores_zarr_path, mode='r')
-#         feat_gt = zarr.open(features_zarr_path, mode='r')
-#     except Exception as e:
-#         logging.error(f"Initialization failed: {e}")
-#         raise
-
-#     # 2. Handle Labels and Indices
-#     all_labels = z_scores['labels'][:].astype(str)
-#     label_to_idx = {l: i for i, l in enumerate(all_labels)}
-    
-#     if target_labels is not None:
-#         valid_indices = [label_to_idx[str(l)] for l in target_labels if str(l) in label_to_idx]
-#         found_labels = [str(all_labels[idx]) for idx in valid_indices]
-#     else:
-#         valid_indices = list(range(len(all_labels)))
-#         found_labels = all_labels.tolist()
-
-#     n_samples = len(valid_indices)
-#     save_indices = np.arange(step_size - 1, max_components, step_size)
-    
-#     # Updated steps: [Mean, Step_1, ..., Step_N, GT]
-#     n_steps = len(save_indices) + 2 
-#     step_names = ["Mean"] + (save_indices + 1).tolist() + ["GT"]
-
-#     # 3. Setup Output Store
-#     root = zarr.open(output_zarr_path, mode='w')
-#     root.attrs['saved_steps'] = step_names
-#     root.create_dataset('labels', data=np.array(found_labels, dtype='U'), overwrite=True)
-    
-#     z_recons = root.create_dataset(
-#         'features',
-#         shape=(n_samples, n_steps, input_dim),
-#         chunks=(1, 1, input_dim),
-#         dtype='float32',
-#         compressor=zarr.Blosc(cname='zstd', clevel=3)
-#     )
-
-#     # 4. Pre-compute the decoded mean shape (Step 0)
-#     # This represents the "average" shape the model has learned.
-#     with torch.no_grad():
-#         mean_recon_norm = model.decoder(latent_mean).numpy().squeeze()
-#         decoded_mean_shape = (mean_recon_norm * train_std) + train_mean
-
-#     # 5. Cumulative Reconstruction Loop
-#     logging.info(f"Deep Reconstruction: {n_samples} samples, {n_steps} steps")
-
-#     with torch.no_grad():
-#         for i, idx in tqdm(enumerate(valid_indices), total=n_samples):
-#             raw_gt = feat_gt['features'][idx].astype(np.float32)
-            
-#             # --- Step 0: Save the Decoded Latent Mean ---
-#             z_recons[i, 0, :] = decoded_mean_shape
-            
-#             # --- Step -1: Save the Ground Truth ---
-#             z_recons[i, -1, :] = raw_gt
-            
-#             # --- Intermediate Steps ---
-#             subject_scores = z_scores['scores'][idx, :]
-#             scores_tensor = torch.from_numpy(subject_scores).float().unsqueeze(0)
-            
-#             # Start at index 1 because index 0 is the Mean
-#             step_counter = 1 
-#             for k_idx in range(max_components):
-#                 if k_idx in save_indices:
-#                     mask = torch.zeros_like(scores_tensor)
-#                     mask[0, :k_idx + 1] = 1.0
-                    
-#                     recon_norm = model.decoder(scores_tensor * mask).numpy().squeeze()
-#                     recon_raw = (recon_norm * train_std) + train_mean
-                    
-#                     z_recons[i, step_counter, :] = recon_raw
-#                     step_counter += 1
-
-#     # Copy metadata
-#     root.attrs['original_shape'] = z_scores.attrs.get('original_shape')
-#     root.attrs['kwargs'] = z_scores.attrs.get('kwargs')
-
-#     logging.info(f"Reconstruction complete.")
-
 
 
 
@@ -775,9 +664,6 @@ def deep_modes_from_pca(
         compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
     )
     
-    root.attrs['coeffs'] = coeffs_range.tolist()
-    root.attrs['n_components'] = limit_k
-
     # 4. Generate Modes
     logging.info(f"Deep Modes: Traversing {limit_k} latent dimensions...")
 
@@ -800,6 +686,7 @@ def deep_modes_from_pca(
                 z_modes[j, i, :] = feat_vec.cpu().numpy().flatten()
 
     # Copy essential attributes for reconstruction
+    root.attrs['coeffs'] = coeffs_range.tolist()
     root.attrs['original_shape'] = checkpoint['original_shape']
     root.attrs['kwargs'] = checkpoint['kwargs']
 

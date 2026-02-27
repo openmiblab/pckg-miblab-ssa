@@ -41,7 +41,16 @@ def eval_at_pts(coeffs, pts, order, degree):
     C_tensor = coeffs.reshape((order, order, order))
     return np.einsum('ijk,pi,pj,pk->p', C_tensor, Bz, By, Bx)
 
-def features_from_mask(mask, orders=(6, 12, 18), degree=3, n_samples=80000):
+def get_orders(order=18, div=3):
+    dims = []
+    current = order
+    while current >= 4:
+        dims.append(int(current))
+        current = current / div
+    return tuple(dims)
+
+def features_from_mask(mask, order=18, div=3, degree=3, n_samples=80000):
+    orders = get_orders(order, div)
     nz, ny, nx = mask.shape
     center = np.array([nz, ny, nx], dtype=np.float32) / 2.0
     scale = np.max([nz, ny, nx]).astype(np.float32) / 2.0
@@ -76,7 +85,8 @@ def features_from_mask(mask, orders=(6, 12, 18), degree=3, n_samples=80000):
     # Concatenate into one 1D array for PCA
     return np.concatenate([c1.flatten(), c2.flatten(), c3.flatten()])
 
-def mask_from_features(combined_coeffs, shape, orders=(6, 12, 18), degree=3):
+def mask_from_features(combined_coeffs, shape, order=18, div=3, degree=3):
+    orders = get_orders(order, div)
     nz, ny, nx = shape
     center = np.array([nz, ny, nx], dtype=np.float32) / 2.0
     scale = np.max([nz, ny, nx]).astype(np.float32) / 2.0

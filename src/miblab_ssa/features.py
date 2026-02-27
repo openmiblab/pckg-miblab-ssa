@@ -4,16 +4,17 @@ from tqdm import tqdm
 import zarr
 import numpy as np
 import gc
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, parallel_backend
 import pandas as pd
 import os
 import numpyradiomics as npr
+from copy import deepcopy
 
 from miblab_ssa.metrics import dice_coefficient, surface_distances
 
 
 
-def _process_sample_orders(smooth_mask_func, zarr_path, sample_idx, min_order, max_order):
+def _process_sample_orders(smooth_mask_func, zarr_path, sample_idx, min_order, max_order, kwargs):
     """Worker function to compute both Dice and Hausdorff for all orders."""
     try:
         root = zarr.open(zarr_path, mode='r')
@@ -23,7 +24,8 @@ def _process_sample_orders(smooth_mask_func, zarr_path, sample_idx, min_order, m
         haus_results = {}
         
         for n in range(min_order, max_order + 1):
-            reconstructed = smooth_mask_func(orig_mask, order=n)
+            kwargs['order'] = n
+            reconstructed = smooth_mask_func(orig_mask, **kwargs)
             
             # Calculate both metrics
             dice_results[n] = dice_coefficient(orig_mask, reconstructed)
@@ -41,7 +43,8 @@ def reconstruction_fidelity(
     hausdorff_csv_path: str = None,
     min_order: int = 2,
     max_order: int = 36,
-    n_jobs: int = -1
+    n_jobs: int = -1,
+    **kwargs
 ):
     """
     Builds two CSVs (Dice and Hausdorff) across spectral reconstruction orders.
@@ -55,22 +58,25 @@ def reconstruction_fidelity(
     print(f"Evaluating reconstruction fidelity for {n_samples} samples up to order {max_order}...")
     
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_process_sample_orders)(smooth_mask_func, dataset_zarr_path, i, min_order, max_order)
+        delayed(_process_sample_orders)(smooth_mask_func, dataset_zarr_path, i, min_order, max_order, deepcopy(kwargs))
         for i in tqdm(range(n_samples))
     )
 
-    # 3. Aggregate results into two separate matrices
-    dice_matrix = np.full((n_samples, max_order), np.nan)
-    haus_matrix = np.full((n_samples, max_order), np.nan)
+    # 3. Aggregate results into matrices
+    # We only need (max_order - min_order + 1) columns
+    num_orders = max_order - min_order + 1
+    dice_matrix = np.full((n_samples, num_orders), np.nan)
+    haus_matrix = np.full((n_samples, num_orders), np.nan)
     
     for sample_idx, d_results, h_results in results:
         if d_results is not None:
-            for order in range(1, max_order + 1):
-                dice_matrix[sample_idx, order - 1] = d_results[order]
-                haus_matrix[sample_idx, order - 1] = h_results[order]
+            # Loop only through the orders that were actually computed
+            for i, order in enumerate(range(min_order, max_order + 1)):
+                dice_matrix[sample_idx, i] = d_results[order]
+                haus_matrix[sample_idx, i] = h_results[order]
 
     # 4. Save to CSVs
-    order_cols = list(range(min_order, max_order + 1))
+    order_cols = [f"Order_{n}" for n in range(min_order, max_order + 1)]
     
     # Save Dice
     df_dice = pd.DataFrame(dice_matrix, index=labels, columns=order_cols)
@@ -88,9 +94,9 @@ def reconstruction_fidelity(
 
 
 def features_from_dataset(
-    features_from_mask: Callable,
-    masks_zarr_path: str,
-    output_zarr_path: str,
+    features_from_mask: Callable = None,
+    masks_zarr_path: str = None,
+    output_zarr_path: str = None,
     n_jobs: int = -1, # -1 uses all available cores
     **kwargs
 ):

@@ -1,5 +1,5 @@
 import os
-from typing import Callable, Tuple, List, Dict, Any
+from typing import Tuple
 import numpy as np
 from sklearn.decomposition import PCA
 import logging
@@ -10,12 +10,10 @@ import pandas as pd
 from dask_ml.decomposition import PCA as daskPCA
 
 
-
-
 def pca_from_features(
-    features_zarr_path: str, 
-    output_zarr_path: str, 
-    n_components=None
+    features_zarr_path: str = None, 
+    output_zarr_path: str = None, 
+    n_components: int = None,
 ):
     """
     Standard Scikit-Learn PCA: Loads the entire feature matrix into RAM.
@@ -243,14 +241,17 @@ def dask_pca_from_features(
 
 
 
+
 def scores_from_features(
-    features_zarr_path, 
-    pca_zarr_path, 
-    output_zarr_path
+    features_zarr_path: str = None, 
+    pca_zarr_path: str = None, 
+    scores_csv_path: str = None,
+    normalized_scores_csv_path: str = None, 
 ):
     """
-    Computes PCA scores entirely in memory using NumPy.
-    Optimized for speed when RAM is sufficient.
+    Computes PCA scores in memory and saves results to CSV files.
+    output_csv_base_path: e.g., 'results/pca_output' 
+    (will create results/pca_output_scores.csv and results/pca_output_norm.csv)
     """
     logging.info(f"Loading data from {os.path.basename(features_zarr_path)} into RAM...")
     
@@ -264,47 +265,34 @@ def scores_from_features(
     mu = pca_root['mean'][:]               # (F,)
     eig_vecs = pca_root['components'][:]   # (K, F)
     var = pca_root['variance'][:]          # (K,)
-    var_ratio = pca_root['variance_ratio'][:] 
 
-    # 3. Compute Projections (NumPy Math)
-    logging.info("Computing projections (Matrix Multiplication)...")
-    
-    # Centering
+    # 3. Compute Projections
+    logging.info("Computing projections...")
     centered = features - mu
-    
-    # Projection: (N, F) @ (F, K) -> (N, K)
-    # Using .T on eig_vecs to get the correct shape for dot product
     scores = centered @ eig_vecs.T
     
-    # Normalization: (N, K) / (K,)
     logging.info("Normalizing scores...")
     normalized_scores = scores / np.sqrt(var)
 
-    # 4. Save to Zarr
-    logging.info(f"Saving results to {output_zarr_path}...")
-    root = zarr.open_group(output_zarr_path, mode='w')
-    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
+    # 4. Convert to Pandas for CSV Export
+    # Create column names (PC_1, PC_2, ..., PC_K)
+    n_components = scores.shape[1]
+    col_names = [f"PC_{i+1}" for i in range(n_components)]
 
-    # Save scores
-    root.create_dataset('scores', 
-                        data=scores.astype(np.float32), 
-                        compressor=compressor)
+    # Create Raw Scores Dataframe
+    df_scores = pd.DataFrame(scores, columns=col_names)
+    df_scores.insert(0, 'label', labels) # Add label at start
     
-    # Save normalized scores
-    root.create_dataset('normalized_scores', 
-                        data=normalized_scores.astype(np.float32), 
-                        compressor=compressor)
+    # Create Normalized Scores Dataframe
+    df_norm = pd.DataFrame(normalized_scores, columns=col_names)
+    df_norm.insert(0, 'label', labels)
 
-    # Save metadata
-    root.create_dataset('labels', data=labels)
-    root.create_dataset('variance', data=var.astype(np.float32))
-    root.create_dataset('variance_ratio', data=var_ratio.astype(np.float32))
-    
-    # Copy essential attributes for reconstruction
-    root.attrs['original_shape'] = feat_root.attrs.get('original_shape')
-    root.attrs['kwargs'] = feat_root.attrs.get('kwargs')
+    # 5. Save to CSV
+    logging.info(f"Saving CSVs...")
+    df_scores.to_csv(scores_csv_path, index=False)
+    df_norm.to_csv(normalized_scores_csv_path, index=False)
 
-    logging.info("Finished PCA projection.")
+    logging.info("Finished PCA projection and CSV export.")
     return scores, normalized_scores
 
 
@@ -387,11 +375,11 @@ def dask_scores_from_features(
 
 
 def modes_from_pca(
-    pca_zarr_path: str, 
-    modes_zarr_path: str, 
-    n_components=8, 
-    n_coeffs=11, 
-    max_coeff=2
+    pca_zarr_path: str = None, 
+    modes_zarr_path: str = None, 
+    n_components: int = 8, 
+    n_coeffs: int = 11, 
+    max_coeff: float = 5  # Typically 2 or 3 standard deviations
 ):
     """
     Generates 3D shape modes by varying PCA coefficients and reconstructing masks.
@@ -420,20 +408,19 @@ def modes_from_pca(
         
     store = zarr.DirectoryStore(modes_zarr_path)
     root = zarr.group(store=store, overwrite=True)
-    compressor = zarr.Blosc(cname='zstd', clevel=3, shuffle=2)
 
     z_modes = root.create_dataset(
         'features',
         shape=(n_coeffs, limit_k, n_features) ,
         chunks=(1, 1, n_features),
         dtype=np.float32,
-        compressor=compressor,
+        compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=2),
     )
 
     # 4. Generate Modes (The "Safe" Loop)
-    msg = f"Modes: Building {n_coeffs * limit_k} feature vectors..."
-    logging.info(msg)
-    for i in tqdm(range(limit_k), desc=msg):
+    logging.info(f"Modes: Building {n_coeffs * limit_k} feature vectors...")
+
+    for i in tqdm(range(limit_k), desc="Processing Modes"):
     
         current_comp = z_pca['components'][i, :]
         for j in range(n_coeffs):
@@ -441,124 +428,206 @@ def modes_from_pca(
             z_modes[j, i, ...] = feat_vec
 
     # 5. Save attributes for the visualization tool
-    root.create_dataset('labels', data=z_pca['labels'][:])
     root.attrs['coeffs'] = coeffs_range.tolist()
-    root.attrs['kwargs'] = z_pca.attrs.get('kwargs')
     root.attrs['original_shape'] = z_pca.attrs.get('original_shape')
+    root.attrs['kwargs'] = z_pca.attrs.get('kwargs')
     
     logging.info(f"Modes: Successfully saved to {modes_zarr_path}")
 
 
 
 def features_from_scores(
-    pca_zarr_path, 
-    scores_zarr_path,
-    output_zarr_path,
-    target_labels=None,
-    n_components=None,
+    pca_zarr_path: str = None, 
+    scores_csv_path: str = None,
+    output_zarr_path: str = None,
+    target_labels: list = None,
+    n_components: int = None,
 ):
+    """
+    Reconstructs features (e.g. spectral representations) from PCA scores stored in a CSV.
+    Reconstruction formula: features = mean + (scores @ components)
+    """
+    # 1. Load PCA Basis
     z_pca = zarr.open(pca_zarr_path, mode='r')
-    z_scores = zarr.open(scores_zarr_path, mode='r')
-    
-    # Use .get() or check keys to prevent KeyErrors
     avr = z_pca['mean'][:] 
-    n_features = z_pca['components'].shape[1]
+    all_components = z_pca['components'][:] # (Total_K, F)
+    n_features = all_components.shape[1]
     
-    # Optimization: Pre-load components once
-    if n_components is None:
-        eig_vecs = z_pca['components'][:]
-    else:
-        eig_vecs = z_pca['components'][:n_components]
-
-    # Label indexing
-    all_labels = z_scores['labels'][:].astype(str)
-    label_to_idx = {l: i for i, l in enumerate(all_labels)}
+    # 2. Load Scores from CSV
+    logging.info(f"Reading scores from {scores_csv_path}...")
+    df = pd.read_csv(scores_csv_path)
     
+    # 3. Filter by labels if requested
     if target_labels is not None:
-        valid_indices = [label_to_idx[str(l)] for l in target_labels if str(l) in label_to_idx]
-        found_labels = [str(l) for l in target_labels if str(l) in label_to_idx]
+        # Ensure labels are compared as strings to be safe
+        df['label_str'] = df['label'].astype(str)
+        target_labels_str = [str(l) for l in target_labels]
+        df = df[df['label_str'].isin(target_labels_str)]
+        if df.empty:
+            logging.error("No matching labels found in CSV.")
+            return
+    
+    found_labels = df['label'].values
+    
+    # 4. Extract score matrix (exclude the label column)
+    # We look for columns starting with 'PC_' or 'Feat_'
+    score_cols = [c for c in df.columns if c.startswith(('PC_', 'Feat_'))]
+    
+    if n_components is not None:
+        score_cols = score_cols[:n_components]
+        eig_vecs = all_components[:n_components]
     else:
-        valid_indices = list(range(len(all_labels)))
-        found_labels = all_labels
+        # Match components to available columns in CSV
+        n_comp_in_csv = len(score_cols)
+        eig_vecs = all_components[:n_comp_in_csv]
+        
+    scores_matrix = df[score_cols].values # (N, K)
 
+    # 5. Perform Reconstruction
+    logging.info(f"Reconstructing {len(found_labels)} samples...")
+    # Math: (N, K) @ (K, F) + (F,) -> (N, F)
+    reconstructed_features = (scores_matrix @ eig_vecs) + avr
+
+    # 6. Save to Zarr
     store = zarr.DirectoryStore(output_zarr_path)
     root = zarr.group(store=store, overwrite=True)
     
-    z_recons = root.create_dataset(
+    root.create_dataset(
         'features',
-        shape=(len(valid_indices), n_features),
+        data=reconstructed_features.astype(np.float32),
         chunks=(1, n_features),
-        dtype='float32',
         compressor=zarr.Blosc(cname='zstd', clevel=3)
     )
-    # Map to fixed-length string or object to avoid Zarr string errors
-    root.array('labels', data=found_labels)
+    
+    # Save labels and copy attributes from PCA root if they exist
+    root.array('labels', data=found_labels.astype(str))
+    
+    # Metadata recovery
+    root.attrs['original_shape'] = z_pca.attrs.get('original_shape')
+    root.attrs['kwargs'] = z_pca.attrs.get('kwargs')
 
-    for i, idx in enumerate(valid_indices):
+    logging.info(f"Reconstruction finished. Output saved to {output_zarr_path}")
+    return reconstructed_features
+
+# def features_from_scores(
+#     pca_zarr_path, 
+#     scores_zarr_path,
+#     output_zarr_path,
+#     target_labels=None,
+#     n_components=None,
+# ):
+#     z_pca = zarr.open(pca_zarr_path, mode='r')
+#     z_scores = zarr.open(scores_zarr_path, mode='r')
+    
+#     # Use .get() or check keys to prevent KeyErrors
+#     avr = z_pca['mean'][:] 
+#     n_features = z_pca['components'].shape[1]
+    
+#     # Optimization: Pre-load components once
+#     if n_components is None:
+#         eig_vecs = z_pca['components'][:]
+#     else:
+#         eig_vecs = z_pca['components'][:n_components]
+
+#     # Label indexing
+#     all_labels = z_scores['labels'][:].astype(str)
+#     label_to_idx = {l: i for i, l in enumerate(all_labels)}
+    
+#     if target_labels is not None:
+#         valid_indices = [label_to_idx[str(l)] for l in target_labels if str(l) in label_to_idx]
+#         found_labels = [str(l) for l in target_labels if str(l) in label_to_idx]
+#     else:
+#         valid_indices = list(range(len(all_labels)))
+#         found_labels = all_labels
+
+#     store = zarr.DirectoryStore(output_zarr_path)
+#     root = zarr.group(store=store, overwrite=True)
+    
+#     z_recons = root.create_dataset(
+#         'features',
+#         shape=(len(valid_indices), n_features),
+#         chunks=(1, n_features),
+#         dtype='float32',
+#         compressor=zarr.Blosc(cname='zstd', clevel=3)
+#     )
+#     # Map to fixed-length string or object to avoid Zarr string errors
+#     root.array('labels', data=found_labels)
+
+#     for i, idx in enumerate(valid_indices):
         
-        if n_components is None:
-            score = z_scores['scores'][idx]
-        else:
-            score = z_scores['scores'][idx,:n_components]
+#         if n_components is None:
+#             score = z_scores['scores'][idx]
+#         else:
+#             score = z_scores['scores'][idx,:n_components]
             
-        # Standard reconstruction: mean + (scores @ components)
-        z_recons[i] = (avr + np.dot(score, eig_vecs)).astype(np.float32)
+#         # Standard reconstruction: mean + (scores @ components)
+#         z_recons[i] = (avr + np.dot(score, eig_vecs)).astype(np.float32)
 
-    # Copy essential attributes for reconstruction
-    root.attrs['original_shape'] = z_scores.attrs.get('original_shape')
-    root.attrs['kwargs'] = z_scores.attrs.get('kwargs')
+#     # Copy essential attributes for reconstruction
+#     root.attrs['original_shape'] = z_scores.attrs.get('original_shape')
+#     root.attrs['kwargs'] = z_scores.attrs.get('kwargs')
 
-    logging.info("Reconstruction finished.")
+#     logging.info("Reconstruction finished.")
 
 
 def cumulative_features_from_scores(
-    pca_zarr_path: str, 
-    scores_zarr_path: str,
-    original_features_zarr_path: str, # Added to match Deep PCA version
-    output_zarr_path: str,
+    pca_zarr_path: str = None, 
+    scores_csv_path: str = None,
+    gt_features_zarr_path: str = None, 
+    output_zarr_path: str = None,
     target_labels: list = None,
-    max_components: int = 10,
-    step_size: int = 1
+    step_size: int = 1,
+    max_components: int = 10
 ):
-    # 1. Open Zarr Stores
+    # 1. Open Stores
     z_pca = zarr.open(pca_zarr_path, mode='r')
-    z_scores = zarr.open(scores_zarr_path, mode='r')
-    z_orig = zarr.open(original_features_zarr_path, mode='r')
+    feat_gt = zarr.open(gt_features_zarr_path, mode='r')
     
     avr = z_pca['mean'][:].astype(np.float32) 
     n_features = z_pca['components'].shape[1]
     
-    # 2. Handle Labels and Indices
-    all_labels = z_scores['labels'][:].astype(str)
-    label_to_idx = {l: i for i, l in enumerate(all_labels)}
+    # Load and Filter CSV
+    df = pd.read_csv(scores_csv_path)
+    label_col = df.columns[0]
     
-    # Matching labels from original features to scores
-    orig_labels = z_orig['labels'][:].astype(str)
-    orig_label_to_idx = {l: i for i, l in enumerate(orig_labels)}
-    
+    # Explicitly grab only PC columns to avoid metadata interference
+    pc_cols = [c for c in df.columns if 'PC' in c][:max_components]
+    max_components = len(pc_cols) 
+
     if target_labels is not None:
-        valid_indices = [label_to_idx[str(l)] for l in target_labels if str(l) in label_to_idx]
-        found_labels = [str(all_labels[idx]) for idx in valid_indices]
-    else:
-        valid_indices = list(range(len(all_labels)))
-        found_labels = all_labels.tolist()
+        target_str = [str(l) for l in target_labels]
+        df = df[df[label_col].astype(str).isin(target_str)]
 
-    n_samples = len(valid_indices)
+    # 2. Sync Labels with Ground Truth Zarr
+    labels_orig = {str(l): i for i, l in enumerate(feat_gt['labels'][:])}
     
-    # Calculate checkpoint indices
-    save_indices = np.arange(step_size - 1, max_components, step_size)
-    # +2 for Step 0 (Average) and Step -1 (Ground Truth)
-    n_steps = len(save_indices) + 2 
-    eig_vecs = z_pca['components'][:max_components].astype(np.float32)
+    # Only keep subjects that exist in BOTH the CSV and the GT Zarr
+    df = df[df[label_col].astype(str).isin(labels_orig.keys())]
 
-    # 3. Setup Output Store
+    if df.empty:
+        logging.error("No matching labels found across CSV and GT Zarr.")
+        return False
+    
+    found_labels = df[label_col].astype(str).tolist()
+    scores_matrix = df[pc_cols].values.astype('float32') # Use explicit PC columns
+
+    # Calculate indices
+    n_samples = len(found_labels)
+    save_indices = np.arange(step_size - 1, max_components, step_size)
+    n_steps = len(save_indices) + 2
+    step_names = ["Mean"] + (save_indices + 1).tolist() + ["GT"]
+
+    # 3. Setup Output
     root = zarr.open(output_zarr_path, mode='w')
-    root.attrs.update(z_pca.attrs) 
-    # Metadata: Index 0 is Mean, last index is GT
-    root.attrs['saved_steps'] = [0] + (save_indices + 1).tolist() + ["GT"]
+    root.attrs['saved_steps'] = step_names
+    
+    # Fix: Safely copy attributes from PCA store
+    for attr in ['original_shape', 'kwargs']:
+        if attr in z_pca.attrs:
+            root.attrs[attr] = z_pca.attrs[attr]
 
     root.create_dataset('labels', data=np.array(found_labels, dtype='U'), overwrite=True)
-    
+
     z_recons = root.create_dataset(
         'features',
         shape=(n_samples, n_steps, n_features),
@@ -568,113 +637,93 @@ def cumulative_features_from_scores(
         overwrite=True
     )
 
-    z_mse_vs_avg = root.create_dataset('mse_vs_avg', shape=(n_samples, n_steps), dtype='float32', overwrite=True)
-    z_recon_error = root.create_dataset('recon_error', shape=(n_samples, n_steps), dtype='float32', overwrite=True)
+    # 4. Loop
+    logging.info(f"Cumulative Reconstruction: {n_samples} samples, {n_steps} steps.")
+    eig_vecs = z_pca['components'][:max_components].astype(np.float32)
 
-    # 4. Cumulative Loop
-    logging.info(f"Linear Reconstruction: {n_samples} samples, {n_steps} steps (Index -1 is GT)")
-
-    for i, idx in tqdm(enumerate(valid_indices), total=n_samples):
-        label = found_labels[i]
-        
-        # Pull Ground Truth for reference
-        if label in orig_label_to_idx:
-            raw_gt = z_orig['features'][orig_label_to_idx[label]].astype(np.float32)
-        else:
-            # Fallback if label missing in original (should not happen with filtered valid_indices)
-            raw_gt = np.zeros(n_features, dtype=np.float32)
-            logging.warning(f"Label {label} not found in original features.")
-
-        # --- Step 0: Save the Average ---
+    for i, label in enumerate(tqdm(found_labels, desc="Cumulative Steps")):
+        # Step 0: Mean
         z_recons[i, 0, :] = avr
-        z_mse_vs_avg[i, 0] = 0.0
-        z_recon_error[i, 0] = np.mean((avr - raw_gt)**2)
-        
-        # --- Step -1: Save the Ground Truth ---
-        z_recons[i, -1, :] = raw_gt
-        z_mse_vs_avg[i, -1] = np.mean((raw_gt - avr)**2)
-        z_recon_error[i, -1] = 0.0 
-        
-        # --- Intermediate Steps: Linear Summation ---
-        scores = z_scores['scores'][idx, :max_components]
+
+        # Step -1: GT (Safe now because of filtering at start)
+        gt_idx = labels_orig[label]
+        z_recons[i, -1, :] = feat_gt['features'][gt_idx].astype(np.float32)
+
+        # Cumulative Summation
+        scores = scores_matrix[i, :]
         current_reconstruction = avr.copy()
-        
         step_counter = 1 
+        
         for k in range(max_components):
             current_reconstruction += (scores[k] * eig_vecs[k])
             
             if k in save_indices:
                 z_recons[i, step_counter, :] = current_reconstruction
-                z_mse_vs_avg[i, step_counter] = np.mean((current_reconstruction - avr)**2)
-                z_recon_error[i, step_counter] = np.mean((current_reconstruction - raw_gt)**2)
                 step_counter += 1
 
     return True
 
 
 def pca_performance(
-    pca_zarr_path: str, 
-    scores_zarr_path: str, 
-    original_features_zarr_path: str, 
-    marginal_mse_path: str,
-    cumulative_mse_path: str,
+    pca_zarr_path: str = None, 
+    scores_csv_path: str = None, 
+    gt_features_zarr_path: str = None, 
+    marginal_mse_csv_path: str = None,
+    cumulative_mse_csv_path: str = None,
     n_components: int = 50,
-) -> Tuple[np.ndarray, np.ndarray]:
+):
+    # 1. Load Data
+    z_pca = zarr.open(pca_zarr_path, mode='r')
+    z_orig = zarr.open(gt_features_zarr_path, mode='r')
+    df_scores = pd.read_csv(scores_csv_path)
     
-    # 1. Open Zarr Stores
-    try:
-        z_pca = zarr.open(pca_zarr_path, mode='r')
-        z_scores = zarr.open(scores_zarr_path, mode='r')
-        z_orig = zarr.open(original_features_zarr_path, mode='r')
-    except Exception as e:
-        logging.error(f"Failed to open Zarr stores: {e}")
-        raise
+    # Setup Columns and Index
+    pc_cols = [c for c in df_scores.columns if c.startswith('PC')][:n_components]
+    labels_scores = df_scores['label'].astype(str).tolist()
+    labels_orig = [str(l) for l in z_orig['labels'][:]]
+    orig_label_to_idx = {l: i for i, l in enumerate(labels_orig)}
 
-    # 2. Load Shared Basis and Metadata
+    # 2. Initialize DataFrames with NaNs
+    # This ensures the CSV has the full structure from the start
+    df_marginal = pd.DataFrame(np.nan, index=labels_scores, columns=pc_cols)
+    df_cumulative = pd.DataFrame(np.nan, index=labels_scores, columns=pc_cols)
+    
+    # 3. Load Basis Arrays
     avr = z_pca['mean'][:]
     eig_vecs = z_pca['components'][:n_components, :]
     
-    labels_scores = [str(l) for l in z_scores['labels'][:]]
-    labels_orig = [str(l) for l in z_orig['labels'][:]]
-    orig_label_to_idx = {l: i for i, l in enumerate(labels_orig)}
-    n_samples = len(labels_scores)
-    
-    # 3. Initialize or Load Progress
-    marginal_mse = np.zeros((n_samples, n_components), dtype=np.float32)
-    cumulative_mse = np.zeros((n_samples, n_components), dtype=np.float32)
+    logging.info(f"Starting evaluation. Saving to CSV every subject.")
 
-    # 4. Sequential Processing Loop
-    logging.info(f"Starting PCA performance evaluation for {n_samples} subjects.")
-    
-    for i, label in enumerate(tqdm(labels_scores, desc="Total Progress")):
-        # --- Skip Logic ---
+    # 4. Processing Loop
+    for i, label in enumerate(tqdm(labels_scores)):
         if label not in orig_label_to_idx:
-            logging.warning(f"Label {label} not found in original masks. Skipping.")
             continue
             
-        # --- Computation ---
-        orig_idx = orig_label_to_idx[label]
-        orig_features = z_orig['features'][orig_idx]
-        subject_scores = z_scores['scores'][i, :n_components]
+        orig_features = z_orig['features'][orig_label_to_idx[label]]
         orig_features_norm = np.linalg.norm(orig_features)
+        subject_scores = df_scores.loc[i, pc_cols].values
         
         current_cumulative_vec = avr.copy()
         
-        for k in range(n_components):
+        # Inner loop for components
+        for k in range(len(pc_cols)):
             score_k = subject_scores[k]
             vec_k = eig_vecs[k, :]
             
-            # Marginal Reconstruction
+            # Marginal calculation
             marginal_feat_vec = avr + (score_k * vec_k)
-            marginal_mse[i, k] = np.linalg.norm(marginal_feat_vec-orig_features)/orig_features_norm
+            err_m = np.linalg.norm(marginal_feat_vec - orig_features) / orig_features_norm
+            df_marginal.iloc[i, k] = err_m
             
-            # Cumulative Reconstruction
+            # Cumulative calculation
             current_cumulative_vec += (score_k * vec_k)
-            cumulative_mse[i, k] = np.linalg.norm(current_cumulative_vec-orig_features)/orig_features_norm
-        
-        # 5. Save Progress per Subject
-        pd.DataFrame(marginal_mse, index=labels_scores).to_csv(marginal_mse_path)
-        pd.DataFrame(cumulative_mse, index=labels_scores).to_csv(cumulative_mse_path)
+            err_c = np.linalg.norm(current_cumulative_vec - orig_features) / orig_features_norm
+            df_cumulative.iloc[i, k] = err_c
+            
+        # --- Save in Loop ---
+        # We save the whole dataframe so the file stays structured and readable
+        if i % 5 == 0 or i == len(labels_scores) - 1: # Save every 5 subjects to reduce I/O lag
+            df_marginal.to_csv(marginal_mse_csv_path)
+            df_cumulative.to_csv(cumulative_mse_csv_path)
 
-    logging.info(f"Performance evaluation complete.")
-    return marginal_mse, cumulative_mse
+    return df_marginal, df_cumulative
