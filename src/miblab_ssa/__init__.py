@@ -9,6 +9,7 @@ from .features import (
     recon_error,
     dataset_shapes,
     reconstruction_fidelity,
+    save_reconstructed_masks,
 )
 from .pca import (
     pca_from_features,

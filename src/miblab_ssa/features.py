@@ -1,10 +1,12 @@
-from typing import Callable
+from typing import Callable, Optional, List
+from dask.distributed import get_worker
+from datetime import datetime
 import logging
 from tqdm import tqdm
 import zarr
 import numpy as np
 import gc
-from joblib import Parallel, delayed, parallel_backend
+from joblib import Parallel, delayed
 import pandas as pd
 import os
 import numpyradiomics as npr
@@ -14,9 +16,136 @@ from miblab_ssa.metrics import dice_coefficient, surface_distances
 
 
 
-def _process_sample_orders(smooth_mask_func, zarr_path, sample_idx, min_order, max_order, kwargs):
+def _reconstruct_and_save_worker(
+    smooth_mask_func, 
+    input_zarr_path, 
+    output_zarr_path, 
+    sample_idx, 
+    target_idx, 
+    min_order, 
+    max_order, 
+    n_samples,
+    kwargs
+):
+    """Worker function to reconstruct masks and save directly to a 5D Zarr."""
+    worker = get_worker()
+    worker_id = f"Worker {worker.name}"
+    try:
+        root_in = zarr.open(input_zarr_path, mode='r')
+        root_out = zarr.open(output_zarr_path, mode='a')
+        
+        orig_mask = root_in['masks'][sample_idx]
+        
+        # 1. Save reconstructed versions
+        for n in range(min_order, max_order + 1):
+            kwargs['order'] = n
+            reconstructed = smooth_mask_func(orig_mask, **kwargs)
+            order_idx = n - min_order
+            root_out['reconstructed_masks'][target_idx, order_idx] = reconstructed
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{timestamp}] {worker_id} finished order {n} / {max_order} of sample {target_idx + 1} / {n_samples}", flush=True)
+        
+        # 2. Save Ground Truth as the final index in the order dimension
+        # The index is (max - min + 1), which is the slot immediately after the last order
+        gt_idx = max_order - min_order + 1
+        root_out['reconstructed_masks'][target_idx, gt_idx] = orig_mask
+        
+        return target_idx, True
+    except Exception as e:
+        print(f"Error processing sample index {sample_idx}: {e}")
+        return target_idx, False
+
+
+def save_reconstructed_masks(
+    smooth_mask_func: Callable = None,
+    dataset_zarr_path: str = None,
+    output_zarr_path: str = None,
+    target_labels: Optional[List] = None,
+    min_order: int = 2,
+    max_order: int = 36,
+    n_jobs: int = -1,
+    **kwargs
+):
+    """
+    Reconstructs masks and saves them as a 5D dataset: (N_targets, N_orders + 1, Z, Y, X).
+    The final index in the N_orders dimension is the original Ground Truth.
+    """
+    root_in = zarr.open(dataset_zarr_path, mode='r')
+    all_labels = [str(l) for l in root_in['labels'][:]]
+    
+    target_indices = []
+    valid_target_labels = []
+
+    if target_labels is None:
+        target_indices = list(range(len(all_labels)))
+        valid_target_labels = all_labels
+    else:
+        for label in target_labels:
+            if str(label) in all_labels:
+                target_indices.append(all_labels.index(str(label)))
+                valid_target_labels.append(str(label))
+            else:
+                logging.warning(f"Label {label} not found in input dataset. Skipping.")
+
+    n_targets = len(target_indices)
+    if n_targets == 0:
+        return
+
+    # --- Setup the 5D Output Zarr Array ---
+    # We add +1 to the order dimension to accommodate the Ground Truth mask
+    num_orders_plus_gt = (max_order - min_order + 1) + 1
+    spatial_shape = root_in['masks'].shape[1:] 
+    output_shape = (n_targets, num_orders_plus_gt, *spatial_shape)
+    output_chunks = (1, 1, *spatial_shape)
+    
+    root_out = zarr.open(output_zarr_path, mode='w') 
+    
+    root_out.create_dataset(
+        'reconstructed_masks', 
+        shape=output_shape, 
+        chunks=output_chunks, 
+        dtype=root_in['masks'].dtype
+    )
+    
+    # Metadata: Fixed-length strings or VLenUTF8 for labels
+    root_out.create_dataset('labels', data=np.array(valid_target_labels))
+    
+    # Orders metadata: append a special value (e.g., -1 or 0) to represent Ground Truth
+    order_values = np.arange(min_order, max_order + 1)
+    order_values_with_gt = np.append(order_values, -1) # -1 signals "Original/GT"
+    root_out.create_dataset('orders', data=order_values_with_gt)
+
+    # --- Parallel Processing ---
+    Parallel(n_jobs=n_jobs)(
+        delayed(_reconstruct_and_save_worker)(
+            smooth_mask_func, 
+            dataset_zarr_path, 
+            output_zarr_path, 
+            orig_idx, 
+            target_idx, 
+            min_order, 
+            max_order, 
+            n_targets,
+            deepcopy(kwargs)
+        ) for target_idx, orig_idx in enumerate(target_indices)
+    )
+        
+    return root_out
+
+
+
+def _process_sample_orders(
+    smooth_mask_func, 
+    zarr_path, 
+    sample_idx, 
+    min_order, 
+    max_order, 
+    n_samples, 
+    kwargs,
+):
     """Worker function to compute both Dice and Hausdorff for all orders."""
     try:
+        logging.info(f"Processing sample {sample_idx + 1} / {n_samples}")
         root = zarr.open(zarr_path, mode='r')
         orig_mask = root['masks'][sample_idx]
         
@@ -30,11 +159,13 @@ def _process_sample_orders(smooth_mask_func, zarr_path, sample_idx, min_order, m
             # Calculate both metrics
             dice_results[n] = dice_coefficient(orig_mask, reconstructed)
             haus_results[n], _ = surface_distances(orig_mask, reconstructed)
-            
+        
+        logging.info(f"Finished processing sample {sample_idx + 1} / {n_samples}")
         return sample_idx, dice_results, haus_results
     except Exception as e:
         print(f"Error processing sample {sample_idx}: {e}")
         return sample_idx, None, None
+    
 
 def reconstruction_fidelity(
     smooth_mask_func: Callable = None,
@@ -56,24 +187,18 @@ def reconstruction_fidelity(
 
     # 2. Parallel Processing
     print(f"Evaluating reconstruction fidelity for {n_samples} samples up to order {max_order}...")
-
-    with tqdm(total=n_samples, desc="Processing Samples") as pbar:
-        results = Parallel(n_jobs=n_jobs)(
-            delayed(_process_sample_orders)(
-                smooth_mask_func, 
-                dataset_zarr_path, 
-                i, 
-                min_order, 
-                max_order, 
-                deepcopy(kwargs)
-            )
-            for i in range(n_samples)
-        )
     
-    # results = Parallel(n_jobs=n_jobs)(
-    #     delayed(_process_sample_orders)(smooth_mask_func, dataset_zarr_path, i, min_order, max_order, deepcopy(kwargs))
-    #     for i in tqdm(range(n_samples))
-    # )
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_process_sample_orders)(
+            smooth_mask_func, 
+            dataset_zarr_path, 
+            i, 
+            min_order, 
+            max_order, 
+            n_samples,
+            deepcopy(kwargs),
+        ) for i in tqdm(range(n_samples))
+    )
 
     # 3. Aggregate results into matrices
     # We only need (max_order - min_order + 1) columns
