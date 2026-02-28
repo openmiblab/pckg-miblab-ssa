@@ -1,6 +1,6 @@
 import numpy as np
 import vreg
-from scipy.ndimage import rotate
+from scipy.ndimage import rotate, label
 from tqdm import tqdm
 
 
@@ -459,6 +459,17 @@ def _inertia_principal_axes(volume, voxel_size=(1.0,1.0,1.0), eps=1e-12):
     # Return inertia matrix as used (unnormalized). If user wants covariance: M / total_mass
     return centroid_phys, eigvecs, eigvals
 
+def select_largest_cluster(mask):
+    # Keep only the largest component (The Kidney)
+    if np.any(mask):
+        labeled, num_features = label(mask)
+        if num_features > 1:
+            # Sort components by size
+            sizes = np.bincount(labeled.ravel())
+            largest_label = sizes[1:].argmax() + 1
+            mask = (labeled == largest_label)
+    return mask
+
 
 def normalize_kidney_mask(mask, voxel_size, side, ref=None, verbose=1):
     """
@@ -481,6 +492,9 @@ def normalize_kidney_mask(mask, voxel_size, side, ref=None, verbose=1):
     # target_volume in mm3
     target_spacing = 1.0
     target_volume = 1e6
+
+    # Select largest cluster
+    mask = select_largest_cluster(mask)
 
     # Optional mirroring
     if side == 'left':

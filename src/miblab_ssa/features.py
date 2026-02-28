@@ -1,5 +1,4 @@
 from typing import Callable, Optional, List
-from dask.distributed import get_worker
 from datetime import datetime
 import logging
 from tqdm import tqdm
@@ -28,8 +27,6 @@ def _reconstruct_and_save_worker(
     kwargs
 ):
     """Worker function to reconstruct masks and save directly to a 5D Zarr."""
-    worker = get_worker()
-    worker_id = f"Worker {worker.name}"
     try:
         root_in = zarr.open(input_zarr_path, mode='r')
         root_out = zarr.open(output_zarr_path, mode='a')
@@ -41,14 +38,14 @@ def _reconstruct_and_save_worker(
             kwargs['order'] = n
             reconstructed = smooth_mask_func(orig_mask, **kwargs)
             order_idx = n - min_order
-            root_out['reconstructed_masks'][target_idx, order_idx] = reconstructed
+            root_out['masks'][target_idx, order_idx] = reconstructed
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{timestamp}] {worker_id} finished order {n} / {max_order} of sample {target_idx + 1} / {n_samples}", flush=True)
+            print(f"[{timestamp}] Finished order {n} / {max_order} of sample {target_idx + 1} / {n_samples}", flush=True)
         
         # 2. Save Ground Truth as the final index in the order dimension
         # The index is (max - min + 1), which is the slot immediately after the last order
         gt_idx = max_order - min_order + 1
-        root_out['reconstructed_masks'][target_idx, gt_idx] = orig_mask
+        root_out['masks'][target_idx, gt_idx] = orig_mask
         
         return target_idx, True
     except Exception as e:
@@ -113,7 +110,7 @@ def save_reconstructed_masks(
     # Orders metadata: append a special value (e.g., -1 or 0) to represent Ground Truth
     order_values = np.arange(min_order, max_order + 1)
     order_values_with_gt = np.append(order_values, -1) # -1 signals "Original/GT"
-    root_out.attrs['saved_steps'] = order_values_with_gt
+    root_out.attrs['saved_steps'] = order_values_with_gt.tolist()
 
     # --- Parallel Processing ---
     Parallel(n_jobs=n_jobs)(
@@ -145,7 +142,6 @@ def _process_sample_orders(
 ):
     """Worker function to compute both Dice and Hausdorff for all orders."""
     try:
-        logging.info(f"Processing sample {sample_idx + 1} / {n_samples}")
         root = zarr.open(zarr_path, mode='r')
         orig_mask = root['masks'][sample_idx]
         
@@ -159,8 +155,9 @@ def _process_sample_orders(
             # Calculate both metrics
             dice_results[n] = dice_coefficient(orig_mask, reconstructed)
             haus_results[n], _ = surface_distances(orig_mask, reconstructed)
-        
-        logging.info(f"Finished processing sample {sample_idx + 1} / {n_samples}")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{timestamp}] Finished order {n} / {max_order} of sample {sample_idx + 1} / {n_samples}", flush=True)
+ 
         return sample_idx, dice_results, haus_results
     except Exception as e:
         print(f"Error processing sample {sample_idx}: {e}")
@@ -174,6 +171,7 @@ def reconstruction_fidelity(
     hausdorff_csv_path: str = None,
     min_order: int = 2,
     max_order: int = 36,
+    n_samples: int = None,
     n_jobs: int = -1,
     **kwargs
 ):
@@ -182,7 +180,8 @@ def reconstruction_fidelity(
     """
     # 1. Setup dimensions and labels
     root = zarr.open(dataset_zarr_path, mode='r')
-    n_samples = root['masks'].shape[0]
+    if n_samples is None: # run all
+        n_samples = root['masks'].shape[0]
     labels = [str(l) for l in root['labels'][:]]
 
     # 2. Parallel Processing
@@ -197,7 +196,7 @@ def reconstruction_fidelity(
             max_order, 
             n_samples,
             deepcopy(kwargs),
-        ) for i in tqdm(range(n_samples))
+        ) for i in range(n_samples)
     )
 
     # 3. Aggregate results into matrices
