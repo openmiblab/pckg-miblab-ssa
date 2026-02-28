@@ -101,7 +101,7 @@ def save_reconstructed_masks(
     root_out = zarr.open(output_zarr_path, mode='w') 
     
     root_out.create_dataset(
-        'reconstructed_masks', 
+        'masks', 
         shape=output_shape, 
         chunks=output_chunks, 
         dtype=root_in['masks'].dtype
@@ -113,7 +113,7 @@ def save_reconstructed_masks(
     # Orders metadata: append a special value (e.g., -1 or 0) to represent Ground Truth
     order_values = np.arange(min_order, max_order + 1)
     order_values_with_gt = np.append(order_values, -1) # -1 signals "Original/GT"
-    root_out.create_dataset('orders', data=order_values_with_gt)
+    root_out.attrs['saved_steps'] = order_values_with_gt
 
     # --- Parallel Processing ---
     Parallel(n_jobs=n_jobs)(
