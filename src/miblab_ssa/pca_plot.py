@@ -82,7 +82,8 @@ def _plot_pca_performance(var_ratio, output_image_path, marginal_mse_path, cumul
 
     # --- MSE PLOTTING HELPER ---
     def render_mse_plot(ax, df, title, y_limit):
-        x_steps = df.columns.astype(float)
+        x_steps = df.columns.astype(str)
+        x_steps = [float(x[3:]) for x in x_steps] # remove 'PC_'
         
         median = df.median(axis=0)
         q1 = df.quantile(0.25, axis=0)
