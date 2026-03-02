@@ -698,9 +698,10 @@ def pca_performance(
     for i, label in enumerate(tqdm(labels_scores)):
         if label not in orig_label_to_idx:
             continue
-            
-        orig_features = z_orig['features'][orig_label_to_idx[label]]
-        orig_features_norm = np.linalg.norm(orig_features)
+        
+        orig_idx = orig_label_to_idx[label]
+        orig_features = z_orig['features'][orig_idx]
+        # orig_features_norm = np.linalg.norm(orig_features)
         subject_scores = df_scores.loc[i, pc_cols].values
         
         current_cumulative_vec = avr.copy()
@@ -712,12 +713,12 @@ def pca_performance(
             
             # Marginal calculation
             marginal_feat_vec = avr + (score_k * vec_k)
-            err_m = np.linalg.norm(marginal_feat_vec - orig_features) / orig_features_norm
+            err_m = np.linalg.norm(marginal_feat_vec - orig_features) #/ orig_features_norm
             df_marginal.iloc[i, k] = err_m
             
             # Cumulative calculation
             current_cumulative_vec += (score_k * vec_k)
-            err_c = np.linalg.norm(current_cumulative_vec - orig_features) / orig_features_norm
+            err_c = np.linalg.norm(current_cumulative_vec - orig_features) #/ orig_features_norm
             df_cumulative.iloc[i, k] = err_c
             
         # --- Save in Loop ---

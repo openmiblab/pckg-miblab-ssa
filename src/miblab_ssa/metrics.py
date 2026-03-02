@@ -48,6 +48,9 @@ def surface_distances(vol_a, vol_b, spacing=(1.0,1.0,1.0)):
     Returns:
       hausdorff, mean_dist
     """
+    if (np.sum(vol_a)==0) or (np.sum(vol_b)==0):
+        return 0, 0
+    
     # extract meshes
     verts_a, faces_a, _, _ = measure.marching_cubes(vol_a.astype(np.uint8), level=0.5, spacing=spacing)
     verts_b, faces_b, _, _ = measure.marching_cubes(vol_b.astype(np.uint8), level=0.5, spacing=spacing)

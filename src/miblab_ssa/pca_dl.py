@@ -383,13 +383,12 @@ def deep_pca_performance(
 
     # 2. Load Scores CSV and Prepare Metadata
     df_scores = pd.read_csv(scores_csv_path)
-    label_col = df_scores.columns[0]
-    
-    labels_scores = df_scores[label_col].astype(str).tolist()
-    scores_matrix = df_scores.iloc[:, 1:].values.astype('float32')
-    
+
+    pc_cols = [c for c in df_scores.columns if c.startswith('PC')][:n_components]
+    labels_scores = df_scores['label'].astype(str).tolist()
     labels_orig = [str(l) for l in feat_gt['labels'][:]]
     orig_label_to_idx = {l: i for i, l in enumerate(labels_orig)}
+    scores_matrix = df_scores.iloc[:, 1:].values.astype('float32')
     
     n_samples = len(labels_scores)
     cumulative_mse = np.zeros((n_samples, n_components), dtype=np.float32)
@@ -429,8 +428,8 @@ def deep_pca_performance(
                 cumulative_mse[i, k_idx] = np.linalg.norm(recon_raw_c - orig_features) / train_mean_norm
         
         # 4. Save Results
-        pd.DataFrame(cumulative_mse, index=labels_scores).to_csv(cumulative_mse_csv_path)
-        pd.DataFrame(marginal_mse, index=labels_scores).to_csv(marginal_mse_csv_path)
+        pd.DataFrame(cumulative_mse, index=labels_scores, columns=pc_cols).to_csv(cumulative_mse_csv_path)
+        pd.DataFrame(marginal_mse, index=labels_scores, columns=pc_cols).to_csv(marginal_mse_csv_path)
 
     logging.info("Performance evaluation complete.")
     return cumulative_mse, marginal_mse

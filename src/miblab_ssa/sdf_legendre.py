@@ -68,7 +68,7 @@ def spectral_vectors(order):
 
 
 
-def features_from_mask(mask, order=15, n_samples=50000, random_seed=42):
+def features_from_mask_regression(mask, order=15, n_samples=50000, random_seed=42):
     np.random.seed(random_seed)
     nz, ny, nx = mask.shape
     
@@ -120,6 +120,47 @@ def features_from_mask(mask, order=15, n_samples=50000, random_seed=42):
     
     return clf.coef_.astype(np.float32)
 
+
+
+def features_from_mask(mask, order=15, saturation_threshold=5.0):
+    nz, ny, nx = mask.shape
+    
+    # 1. Full Volume SDF (Deterministic, no sampling)
+    mask = mask.astype(bool)
+    sdf = (distance_transform_edt(~mask) - distance_transform_edt(mask)).astype(np.float32)
+    # Tanh saturation is vital for "explainability" in integration
+    sdf_sat = saturation_threshold * np.tanh(sdf / saturation_threshold)
+
+    # 2. Setup Normalized Coordinates
+    z_coords = (np.arange(nz) - nz/2.0) / (max(nz, ny, nx)/2.0)
+    y_coords = (np.arange(ny) - ny/2.0) / (max(nz, ny, nx)/2.0)
+    x_coords = (np.arange(nx) - nx/2.0) / (max(nz, ny, nx)/2.0)
+
+    # 3. Precompute 1D Legendre Basis Mats
+    Lz = legvander(z_coords, order) # Shape (nz, order+1)
+    Ly = legvander(y_coords, order) # Shape (ny, order+1)
+    Lx = legvander(x_coords, order) # Shape (nx, order+1)
+
+    # 4. Integrate (The "Spectral" Way)
+    # We use tensordot to efficiently project the 3D volume onto the basis
+    # This is the full-volume equivalent of your Ridge Regression
+    coeffs = []
+    order_sq = order**2
+    for i, j, k in product(range(order + 1), repeat=3):
+        if (i**2 + j**2 + k**2) <= order_sq:
+            # This line performs the 3D integral for one specific basis function
+            # It's identical to: np.sum(sdf_sat * 3D_Legendre_Basis_i_j_k)
+            # But much faster using separated 1D bases
+            term = np.einsum('zyx,z,y,x->', sdf_sat, Lz[:, i], Ly[:, j], Lx[:, k])
+            
+            # Normalization factor for Legendre: (2n+1)/2
+            # Since it's 3D, we multiply the factors for i, j, and k
+            norm = ((2*i + 1)/2) * ((2*j + 1)/2) * ((2*k + 1)/2)
+            coeffs.append(term * norm / (nz*ny*nx))
+
+    return np.array(coeffs, dtype=np.float32)
+
+
 def mask_from_features(coeffs, shape, order):
     nz, ny, nx = shape
     center = np.array([nz, ny, nx]) / 2.0
@@ -135,19 +176,21 @@ def mask_from_features(coeffs, shape, order):
     Tx = legvander(x_coords, order).T
 
     C_tensor = np.zeros((order + 1, order + 1, order + 1))
+    order_sq = order**2
     idx = 0
     for i, j, k in product(range(order + 1), repeat=3):
-        if i + j + k <= order:
+        if (i**2 + j**2 + k**2) <= order_sq:
             C_tensor[i, j, k] = coeffs[idx]
             idx += 1
 
     # Tensor Contraction
     recon_sdf = np.einsum('ijk,iz,jy,kx->zyx', C_tensor, Tz, Ty, Tx, optimize='optimal')
+    recon_sdf = recon_sdf < 0
 
-    # Geometric Crop for high-order stability
-    zz, yy, xx = np.meshgrid(z_coords, y_coords, x_coords, indexing='ij')
-    valid_box = (np.abs(zz) <= 1.0) & (np.abs(yy) <= 1.0) & (np.abs(xx) <= 1.0)
-    recon_sdf = (recon_sdf < 0) & valid_box
+    # # Geometric Crop for high-order stability
+    # zz, yy, xx = np.meshgrid(z_coords, y_coords, x_coords, indexing='ij')
+    # valid_box = (np.abs(zz) <= 1.0) & (np.abs(yy) <= 1.0) & (np.abs(xx) <= 1.0)
+    # recon_sdf = recon_sdf & valid_box
 
     # POST-PROCESS: Keep only the largest component (The Kidney)
     if np.any(recon_sdf):
