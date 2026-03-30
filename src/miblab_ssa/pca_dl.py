@@ -202,33 +202,45 @@ def deep_cv_pca_from_features(
 
         fold_results.append(val_loss / len(val_loader))
 
-    # 4. Final Training (on all data) for the production model
-    logging.info(f"Cross-validation complete. Average Val Loss: {np.mean(fold_results):.6f}")
-    logging.info("Training final production model on full dataset...")
+    # HERE: add a setup to find the correct number of epochs from the cv results
+    n_epochs = 100
+
+    # Then run again on the whole dataset
+    deep_pca_from_features(
+        features_zarr_path, 
+        model_pth_path,
+        n_components, 
+        epochs = n_epochs, 
+        batch_size = batch_size,
+    )
+
+    # # 4. Final Training (on all data) for the production model
+    # logging.info(f"Cross-validation complete. Average Val Loss: {np.mean(fold_results):.6f}")
+    # logging.info("Training final production model on full dataset...")
     
-    final_model = OrderedAutoencoder(n_features, n_components)
-    final_optimizer = torch.optim.Adam(final_model.parameters(), lr=1e-3)
-    full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True)
+    # final_model = OrderedAutoencoder(n_features, n_components)
+    # final_optimizer = torch.optim.Adam(final_model.parameters(), lr=1e-3)
+    # full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True)
     
-    for epoch in range(epochs):
-        final_model.train()
-        for x in full_loader:
-            k = np.random.randint(1, n_components + 1)
-            recon, _ = final_model(x, mask_dim=k)
-            loss = criterion(recon, x)
-            final_optimizer.zero_grad()
-            loss.backward()
-            final_optimizer.step()
+    # for epoch in range(epochs):
+    #     final_model.train()
+    #     for x in full_loader:
+    #         k = np.random.randint(1, n_components + 1)
+    #         recon, _ = final_model(x, mask_dim=k)
+    #         loss = criterion(recon, x)
+    #         final_optimizer.zero_grad()
+    #         loss.backward()
+    #         final_optimizer.step()
     
-    checkpoint = {
-        'model_state_dict': final_model.state_dict(),
-        'train_mean': full_dataset.mean,
-        'train_std': full_dataset.std,
-        'input_dim': n_features,
-        'latent_dim': n_components,
-        'cv_val_losses': fold_results  # Helpful for reporting
-    }
-    torch.save(checkpoint, model_pth_path)
+    # checkpoint = {
+    #     'model_state_dict': final_model.state_dict(),
+    #     'train_mean': full_dataset.mean,
+    #     'train_std': full_dataset.std,
+    #     'input_dim': n_features,
+    #     'latent_dim': n_components,
+    #     'cv_val_losses': fold_results  # Helpful for reporting
+    # }
+    # torch.save(checkpoint, model_pth_path)
 
 
 
