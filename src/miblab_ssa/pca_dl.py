@@ -111,7 +111,7 @@ def deep_pca_from_features(
         for x in loader:
             k = np.random.randint(1, n_components + 1)
             recon, _ = model(x, mask_dim=k)
-            loss = criterion(recon, x)
+            loss = criterion(recon, x) 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()

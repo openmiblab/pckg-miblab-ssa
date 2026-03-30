@@ -173,17 +173,28 @@ def plot_pca_reconstruction_performance(
         # Median line
         ax.plot(x_numeric, median, color=line_color, alpha=0.9, linestyle='-', lw=2.5, zorder=4)
         ax.scatter(x_numeric, median, color=line_color, s=60, label='Median', edgecolors='white', zorder=5)
+
+        # 1. Ensure a tick exists for every single data point
+        ax.set_xticks(x_numeric)
+        
+        # 2. Create a list of labels where only every 5th one is shown
+        # We use an empty string '' for the ones we want to hide
+        n = 5
+        custom_labels = [
+            str(label) if i % n == 0 else '' 
+            for i, label in enumerate(steps)
+        ]
+        
+        # 3. Apply the custom labels
+        ax.set_xticklabels(custom_labels, rotation=0)
         
         # Aesthetics
         ax.set_title(title, fontsize=15, fontweight='bold', pad=15)
         ax.set_ylabel(ylabel, fontsize=12, fontweight='semibold')
         ax.set_xlabel("Reconstruction Progress (Components)", fontsize=12)
         
-        # Set ticks and labels (handles "Mean" string and numeric steps)
-        ax.set_xticks(x_numeric)
-        ax.set_xticklabels(steps, rotation=0)
-        
         ax.set_ylim(0, df.values.max() * 1.15)
+        ax.grid(axis='x', linestyle=':', alpha=0.2) # Optional: light vertical grid
         ax.grid(axis='y', linestyle='--', alpha=0.3)
         ax.legend(loc='upper right', fontsize='small', frameon=True)
 
@@ -294,6 +305,7 @@ def plot_reconstruction_fidelity(
 def plot_mask_sections(
     dataset_zarr_path: str = None, 
     dir_png: str = None,
+    n_components: int = None
 ):
     # 1. Load the dataset
     # Expected shape: (n_cols, n_rows, x, y, z)
@@ -306,11 +318,18 @@ def plot_mask_sections(
 
     # Define the planes to extract
     # Mapping plane name to the slicing logic
-    planes = {
-        "axial":     lambda d: d[:, :, :, :, centers[2]],  # (C, R, X, Y)
-        "sagittal":  lambda d: d[:, :, :, centers[1], :].transpose(0, 1, 3, 2),  # (C, R, X, Z)
-        "coronal":   lambda d: d[:, :, centers[0], :, :].transpose(0, 1, 3, 2),  # (C, R, Y, Z)
-    }
+    if n_components is not None:
+        planes = {
+            "axial":     lambda d: d[:n_components, :, :, :, centers[2]],  # (C, R, X, Y)
+            "sagittal":  lambda d: d[:n_components, :, :, centers[1], :].transpose(0, 1, 3, 2),  # (C, R, X, Z)
+            "coronal":   lambda d: d[:n_components, :, centers[0], :, :].transpose(0, 1, 3, 2),  # (C, R, Y, Z)
+        }
+    else:
+        planes = {
+            "axial":     lambda d: d[:, :, :, :, centers[2]],  # (C, R, X, Y)
+            "sagittal":  lambda d: d[:, :, :, centers[1], :].transpose(0, 1, 3, 2),  # (C, R, X, Z)
+            "coronal":   lambda d: d[:, :, centers[0], :, :].transpose(0, 1, 3, 2),  # (C, R, Y, Z)
+        }
 
     for name, slice_func in planes.items():
         # Extract the 4D grid of 2D slices
