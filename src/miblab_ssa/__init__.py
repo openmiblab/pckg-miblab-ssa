@@ -44,6 +44,7 @@ from .pca_plot import (
 from .pca_dl import (
     add_deep_pca_metrics,
     deep_pca_from_features,
+    deep_cv_pca_from_features,
     deep_scores_from_features,
     deep_features_from_scores,
     deep_modes_from_pca,

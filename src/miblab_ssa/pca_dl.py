@@ -10,6 +10,8 @@ import pandas as pd
 from typing import Tuple
 from sklearn.model_selection import KFold
 import os
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 
 
 class OrderedAutoencoder(nn.Module):
@@ -132,8 +134,6 @@ def deep_pca_from_features(
     }
     torch.save(checkpoint, model_pth_path)
 
-
-
 def deep_cv_pca_from_features(
     features_zarr_path=None, 
     model_pth_path=None,
@@ -144,41 +144,42 @@ def deep_cv_pca_from_features(
 ):
     # 1. Setup Data
     logging.info(f"Connecting to {features_zarr_path}...")
-    full_dataset = ZarrStreamingDataset(features_zarr_path)
-    n_features = full_dataset.data.shape[1]
-    n_samples = len(full_dataset)
-    
-    # Initialize KFold
+    dataset = ZarrStreamingDataset(features_zarr_path)
+    n_features = dataset.data.shape[1]
+    n_samples = len(dataset)
+    criterion = nn.MSELoss()
+
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
     
-    # We will track the best model across all folds or aggregate metrics
-    fold_results = []
+    fold_best_epochs = []
+    fold_best_val_losses = []
+    fold_val_loss_curves   = []
+    fold_train_loss_curves = []
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(n_samples))):
         logging.info(f"--- Starting Fold {fold + 1}/{n_folds} ---")
         
-        # Create Subsets
-        train_sub = Subset(full_dataset, train_idx)
-        val_sub = Subset(full_dataset, val_idx)
-        
+        train_sub = Subset(dataset, train_idx)
+        val_sub   = Subset(dataset, val_idx)
         train_loader = DataLoader(train_sub, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_sub, batch_size=batch_size, shuffle=False)
+        val_loader   = DataLoader(val_sub,   batch_size=batch_size, shuffle=False)
 
-        # 2. Initialize Model for this fold
-        model = OrderedAutoencoder(n_features, n_components)
+        model     = OrderedAutoencoder(n_features, n_components)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        criterion = nn.MSELoss()
 
-        # 3. Training Loop
+        best_val_loss    = float('inf')
+        best_epoch       = 0
+        val_loss_curve   = []
+        train_loss_curve = []
+
         for epoch in range(epochs):
             # --- Training Phase ---
             model.train()
-            train_loss = 0
+            train_loss = 0.0
             for x in train_loader:
                 k = np.random.randint(1, n_components + 1)
                 recon, _ = model(x, mask_dim=k)
                 loss = criterion(recon, x)
-                
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -186,33 +187,346 @@ def deep_cv_pca_from_features(
 
             # --- Validation Phase ---
             model.eval()
-            val_loss = 0
+            val_loss = 0.0
             with torch.no_grad():
                 for x_val in val_loader:
-                    # Validate on the full bottleneck (no mask) 
-                    # or a random k to match training behavior
-                    recon_val, _ = model(x_val) 
-                    v_loss = criterion(recon_val, x_val)
-                    val_loss += v_loss.item()
+                    recon_val, _ = model(x_val)
+                    val_loss += criterion(recon_val, x_val).item()
+
+            avg_train = train_loss / len(train_loader)
+            avg_val   = val_loss   / len(val_loader)
+            train_loss_curve.append(avg_train)
+            val_loss_curve.append(avg_val)
+
+            if avg_val < best_val_loss:
+                best_val_loss = avg_val
+                best_epoch    = epoch + 1
+
+            if (epoch + 1) % 10 == 0:
+                logging.info(
+                    f"Fold {fold+1} | Epoch {epoch+1}/{epochs} | "
+                    f"Train Loss: {avg_train:.6f} | Val Loss: {avg_val:.6f} | "
+                    f"Best epoch so far: {best_epoch}"
+                )
+
+        logging.info(f"Fold {fold+1} best epoch: {best_epoch} (val loss: {best_val_loss:.6f})")
+        fold_best_epochs.append(best_epoch)
+        fold_best_val_losses.append(best_val_loss)
+        fold_val_loss_curves.append(val_loss_curve)
+        fold_train_loss_curves.append(train_loss_curve)
+
+    epoch_axis     = np.arange(1, epochs + 1)
+    optimal_epochs = int(round(np.mean(fold_best_epochs)))
+
+    # 2. Plot all folds' validation loss curves on a single axis
+    fig, ax = plt.subplots(figsize=(10, 5))
+    colors = cm.tab10(np.linspace(0, 1, n_folds))
+
+    for fold_idx, (curve, best_ep) in enumerate(zip(fold_val_loss_curves, fold_best_epochs)):
+        color = colors[fold_idx]
+        ax.plot(epoch_axis, curve, color=color, label=f"Fold {fold_idx + 1}")
+        ax.scatter(
+            best_ep, curve[best_ep - 1],
+            color=color, s=80, zorder=5,
+            marker='o', edgecolors='black', linewidths=0.8
+        )
+
+    ax.axvline(
+        optimal_epochs, color='red', linestyle='--', linewidth=1.5,
+        label=f"Optimal stop (epoch {optimal_epochs})"
+    )
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Validation Loss")
+    ax.set_title("Validation Loss per Fold (dots = best epoch per fold)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    plot_path = model_pth_path.replace(".pth", "_cv_val_loss.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    logging.info(f"Validation loss plot saved to {plot_path}")
+
+    # 3. Plot per-fold subplots: train vs val loss
+    ncols = 2
+    nrows = (n_folds + 1) // ncols
+    fig2, axes = plt.subplots(nrows, ncols, figsize=(12, 4 * nrows), sharex=True)
+    axes = axes.flatten()
+
+    for fold_idx, (train_curve, val_curve, best_ep) in enumerate(
+        zip(fold_train_loss_curves, fold_val_loss_curves, fold_best_epochs)
+    ):
+        ax = axes[fold_idx]
+        ax.plot(epoch_axis, train_curve, label="Train loss", color="steelblue")
+        ax.plot(epoch_axis, val_curve,   label="Val loss",   color="darkorange")
+        ax.axvline(best_ep, color="red", linestyle="--", linewidth=1.2,
+                   label=f"Best epoch ({best_ep})")
+        ax.set_title(f"Fold {fold_idx + 1}")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    for idx in range(n_folds, len(axes)):
+        axes[idx].set_visible(False)
+
+    fig2.suptitle("Train vs Validation Loss per Fold", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+
+    fold_plot_path = model_pth_path.replace(".pth", "_cv_fold_losses.png")
+    plt.savefig(fold_plot_path, dpi=150)
+    plt.close()
+    logging.info(f"Per-fold loss plot saved to {fold_plot_path}")
+
+    # 4. Derive stopping criteria from cross-validation
+    logging.info(
+        f"\nCross-validation complete."
+        f"\n  Best epochs per fold : {fold_best_epochs}"
+        f"\n  Avg best val loss    : {np.mean(fold_best_val_losses):.6f}"
+        f"\n  Optimal stopping epoch for full training: {optimal_epochs}"
+    )
+
+    # 5. Final training on ALL data, stopped at optimal_epochs
+    logging.info(f"Training final model on full dataset for {optimal_epochs} epochs...")
+    
+    final_model     = OrderedAutoencoder(n_features, n_components)
+    final_optimizer = torch.optim.Adam(final_model.parameters(), lr=1e-3)
+    full_loader     = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    for epoch in range(optimal_epochs):
+        final_model.train()
+        epoch_loss = 0.0
+        for x in full_loader:
+            k = np.random.randint(1, n_components + 1)
+            recon, _ = final_model(x, mask_dim=k)
+            loss = criterion(recon, x)
+            final_optimizer.zero_grad()
+            loss.backward()
+            final_optimizer.step()
+            epoch_loss += loss.item()
+
+        if (epoch + 1) % 10 == 0:
+            logging.info(
+                f"Final model | Epoch {epoch+1}/{optimal_epochs} | "
+                f"Train Loss: {epoch_loss/len(full_loader):.6f}"
+            )
+
+    # Save Model Checkpoint
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'train_mean': dataset.mean,
+        'train_std': dataset.std,
+        'input_dim': n_features,
+        'latent_dim': n_components,
+        'original_shape': dataset.root.attrs.get('original_shape'),
+        'kwargs': dataset.root.attrs.get('kwargs'),
+    }
+    torch.save(checkpoint, model_pth_path)
+    logging.info(f"Final model saved to {model_pth_path}")
+
+def _deep_cv_pca_from_features(
+    features_zarr_path=None, 
+    model_pth_path=None,
+    n_components=25, 
+    epochs=100, 
+    batch_size=64,
+    n_folds=5
+):
+    # 1. Setup Data
+    logging.info(f"Connecting to {features_zarr_path}...")
+    dataset = ZarrStreamingDataset(features_zarr_path)
+    n_features = dataset.data.shape[1]
+    n_samples = len(dataset)
+    criterion = nn.MSELoss()
+
+    # Initialize KFold
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+    
+    fold_best_epochs = []   # ← stores the best stopping epoch per fold
+    fold_best_val_losses = []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(n_samples))):
+        logging.info(f"--- Starting Fold {fold + 1}/{n_folds} ---")
+        
+        train_sub = Subset(dataset, train_idx)
+        val_sub   = Subset(dataset, val_idx)
+        train_loader = DataLoader(train_sub, batch_size=batch_size, shuffle=True)
+        val_loader   = DataLoader(val_sub,   batch_size=batch_size, shuffle=False)
+
+        model     = OrderedAutoencoder(n_features, n_components)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        best_val_loss  = float('inf')
+        best_epoch     = 0              # ← track which epoch was best
+
+        for epoch in range(epochs):
+            # --- Training Phase ---
+            model.train()
+            train_loss = 0.0
+            for x in train_loader:
+                k = np.random.randint(1, n_components + 1)
+                recon, _ = model(x, mask_dim=k)
+                loss = criterion(recon, x)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+
+            # --- Validation Phase ---
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for x_val in val_loader:
+                    recon_val, _ = model(x_val)
+                    val_loss += criterion(recon_val, x_val).item()
+
+            avg_val = val_loss / len(val_loader)
+
+            # ← Record the epoch with the lowest validation loss
+            if avg_val < best_val_loss:
+                best_val_loss = avg_val
+                best_epoch    = epoch + 1   # 1-indexed
 
             if (epoch + 1) % 10 == 0:
                 avg_train = train_loss / len(train_loader)
-                avg_val = val_loss / len(val_loader)
-                logging.info(f"Fold {fold+1} | Epoch {epoch+1} | Train Loss: {avg_train:.6f} | Val Loss: {avg_val:.6f}")
+                logging.info(
+                    f"Fold {fold+1} | Epoch {epoch+1}/{epochs} | "
+                    f"Train Loss: {avg_train:.6f} | Val Loss: {avg_val:.6f} | "
+                    f"Best epoch so far: {best_epoch}"
+                )
 
-        fold_results.append(val_loss / len(val_loader))
+        logging.info(f"Fold {fold+1} best epoch: {best_epoch} (val loss: {best_val_loss:.6f})")
+        fold_best_epochs.append(best_epoch)
+        fold_best_val_losses.append(best_val_loss)
 
-    # HERE: add a setup to find the correct number of epochs from the cv results
-    n_epochs = 100
-
-    # Then run again on the whole dataset
-    deep_pca_from_features(
-        features_zarr_path, 
-        model_pth_path,
-        n_components, 
-        epochs = n_epochs, 
-        batch_size = batch_size,
+    # 2. Derive stopping criteria from cross-validation
+    # ← This is the key step: optimal_epochs comes from CV, not a manual guess
+    optimal_epochs = int(round(np.mean(fold_best_epochs)))
+    logging.info(
+        f"\nCross-validation complete."
+        f"\n  Best epochs per fold : {fold_best_epochs}"
+        f"\n  Avg best val loss    : {np.mean(fold_best_val_losses):.6f}"
+        f"\n  → Optimal stopping epoch for full training: {optimal_epochs}"
     )
+
+    # 3. Final training on ALL data, stopped at optimal_epochs
+    logging.info(f"Training final model on full dataset for {optimal_epochs} epochs...")
+    
+    final_model     = OrderedAutoencoder(n_features, n_components)
+    final_optimizer = torch.optim.Adam(final_model.parameters(), lr=1e-3)
+    full_loader     = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    for epoch in range(optimal_epochs):          # ← uses CV-derived stopping point
+        final_model.train()
+        epoch_loss = 0.0
+        for x in full_loader:
+            k = np.random.randint(1, n_components + 1)
+            recon, _ = final_model(x, mask_dim=k)
+            loss = criterion(recon, x)
+            final_optimizer.zero_grad()
+            loss.backward()
+            final_optimizer.step()
+            epoch_loss += loss.item()
+
+        if (epoch + 1) % 10 == 0:
+            logging.info(
+                f"Final model | Epoch {epoch+1}/{optimal_epochs} | "
+                f"Train Loss: {epoch_loss/len(full_loader):.6f}"
+            )
+
+    checkpoint = {
+        'model_state_dict':  final_model.state_dict(),
+        'train_mean':        dataset.mean,
+        'train_std':         dataset.std,
+        'input_dim':         n_features,
+        'latent_dim':        n_components,
+        'optimal_epochs':    optimal_epochs,         # ← saved for reproducibility
+        'cv_best_epochs':    fold_best_epochs,
+        'cv_val_losses':     fold_best_val_losses,
+    }
+    torch.save(checkpoint, model_pth_path)
+    logging.info(f"Model saved to {model_pth_path}")
+
+
+# def deep_cv_pca_from_features(
+#     features_zarr_path=None, 
+#     model_pth_path=None,
+#     n_components=25, 
+#     epochs=100, 
+#     batch_size=64,
+#     n_folds=5
+# ):
+#     # 1. Setup Data
+#     logging.info(f"Connecting to {features_zarr_path}...")
+#     dataset = ZarrStreamingDataset(features_zarr_path)
+#     n_features = dataset.data.shape[1]
+#     n_samples = len(dataset)
+    
+#     # Initialize KFold
+#     kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+    
+#     # We will track the best model across all folds or aggregate metrics
+#     fold_results = []
+
+#     for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(n_samples))):
+#         logging.info(f"--- Starting Fold {fold + 1}/{n_folds} ---")
+        
+#         # Create Subsets
+#         train_sub = Subset(dataset, train_idx)
+#         val_sub = Subset(dataset, val_idx)
+        
+#         train_loader = DataLoader(train_sub, batch_size=batch_size, shuffle=True)
+#         val_loader = DataLoader(val_sub, batch_size=batch_size, shuffle=False)
+
+#         # 2. Initialize Model for this fold
+#         model = OrderedAutoencoder(n_features, n_components)
+#         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+#         criterion = nn.MSELoss()
+
+#         # 3. Training Loop
+#         for epoch in range(epochs):
+#             # --- Training Phase ---
+#             model.train()
+#             train_loss = 0
+#             for x in train_loader:
+#                 k = np.random.randint(1, n_components + 1)
+#                 recon, _ = model(x, mask_dim=k)
+#                 loss = criterion(recon, x)
+                
+#                 optimizer.zero_grad()
+#                 loss.backward()
+#                 optimizer.step()
+#                 train_loss += loss.item()
+
+#             # --- Validation Phase ---
+#             model.eval()
+#             val_loss = 0
+#             with torch.no_grad():
+#                 for x_val in val_loader:
+#                     # Validate on the full bottleneck (no mask) 
+#                     # or a random k to match training behavior
+#                     recon_val, _ = model(x_val) 
+#                     v_loss = criterion(recon_val, x_val)
+#                     val_loss += v_loss.item()
+
+#             if (epoch + 1) % 10 == 0:
+#                 avg_train = train_loss / len(train_loader)
+#                 avg_val = val_loss / len(val_loader)
+#                 logging.info(f"Fold {fold+1} | Epoch {epoch+1} | Train Loss: {avg_train:.6f} | Val Loss: {avg_val:.6f}")
+
+#         fold_results.append(val_loss / len(val_loader))
+
+#     # HERE: add a setup to find the correct number of epochs from the cv results
+#     n_epochs = 100
+
+#     # Then run again on the whole dataset
+#     deep_pca_from_features(
+#         features_zarr_path, 
+#         model_pth_path,
+#         n_components, 
+#         epochs = n_epochs, 
+#         batch_size = batch_size,
+#     )
 
     # # 4. Final Training (on all data) for the production model
     # logging.info(f"Cross-validation complete. Average Val Loss: {np.mean(fold_results):.6f}")
@@ -220,7 +534,7 @@ def deep_cv_pca_from_features(
     
     # final_model = OrderedAutoencoder(n_features, n_components)
     # final_optimizer = torch.optim.Adam(final_model.parameters(), lr=1e-3)
-    # full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True)
+    # full_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
     # for epoch in range(epochs):
     #     final_model.train()
@@ -234,8 +548,8 @@ def deep_cv_pca_from_features(
     
     # checkpoint = {
     #     'model_state_dict': final_model.state_dict(),
-    #     'train_mean': full_dataset.mean,
-    #     'train_std': full_dataset.std,
+    #     'train_mean': dataset.mean,
+    #     'train_std': dataset.std,
     #     'input_dim': n_features,
     #     'latent_dim': n_components,
     #     'cv_val_losses': fold_results  # Helpful for reporting
@@ -589,8 +903,7 @@ def deep_features_from_scores(
     scores_matrix = df.iloc[:, 1:].values.astype('float32')
 
     # 3. Setup Output Store (Zarr)
-    store = zarr.DirectoryStore(features_zarr_path)
-    root = zarr.group(store=store, overwrite=True)
+    root = zarr.open(features_zarr_path, mode='w')
 
     z_recons = root.create_dataset(
         'features',
