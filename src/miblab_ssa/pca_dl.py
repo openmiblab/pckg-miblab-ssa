@@ -87,12 +87,58 @@ class ZarrStreamingDataset(Dataset):
         normalized = (sample - self.mean) / self.std
         return torch.from_numpy(normalized)
     
+
+def covariance_loss(z: torch.Tensor) -> torch.Tensor:
+    """
+    Off-diagonal covariance penalty on a batch of latent codes.
+
+    Ref: Ladjal et al., "A PCA-like Autoencoder" (arXiv:1904.01277)
+
+    Args:
+        z: Tensor of shape (batch_size, n_active_components)
+
+    Returns:
+        Scalar loss.
+    """
+    N, D = z.shape
+    if N < 2:
+        return z.new_tensor(0.0)
+
+    z = z - z.mean(dim=0)
+    cov = (z.T @ z) / (N - 1)
+
+    off_diag = cov.clone()
+    off_diag.fill_diagonal_(0.0)
+
+    num_off_diag = D * (D - 1)
+    return (off_diag ** 2).sum() / num_off_diag
+
+
+def explicit_mse_loss(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Explicit implementation of Mean Squared Error.
+    
+    Args:
+        input: The predicted tensor (recon)
+        target: The ground truth tensor (x)
+    """
+    # 1. Calculate the element-wise difference
+    error = input - target
+    
+    # 2. Square the errors
+    squared_error = error ** 2
+    
+    # 3. Return the mean of all elements
+    return torch.mean(squared_error)
+
+    
 def deep_pca_from_features(
     features_zarr_path: str = None, 
     model_pth_path: str = None,
     n_components: int = 25, 
     epochs: int = 100, 
     batch_size: int = 64,
+    cov_weight = 0.0,
 ):
     # 1. Setup Lazy Loading
     logging.info(f"Connecting to {features_zarr_path}...")
@@ -112,8 +158,8 @@ def deep_pca_from_features(
         epoch_loss = 0
         for x in loader:
             k = np.random.randint(1, n_components + 1)
-            recon, _ = model(x, mask_dim=k)
-            loss = criterion(recon, x) 
+            recon, z = model(x, mask_dim=k)
+            loss = criterion(recon, x) + (cov_weight * covariance_loss(z[:, :k]))
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -140,7 +186,8 @@ def deep_cv_pca_from_features(
     n_components=25, 
     epochs=100, 
     batch_size=64,
-    n_folds=5
+    n_folds=5,
+    cov_weight = 0.0,
 ):
     # 1. Setup Data
     logging.info(f"Connecting to {features_zarr_path}...")
@@ -178,8 +225,12 @@ def deep_cv_pca_from_features(
             train_loss = 0.0
             for x in train_loader:
                 k = np.random.randint(1, n_components + 1)
-                recon, _ = model(x, mask_dim=k)
-                loss = criterion(recon, x)
+                recon, z = model(x, mask_dim=k)
+
+                recon_loss = criterion(recon, x) 
+                cov_loss = covariance_loss(z[:, :k])
+                loss = recon_loss + (cov_weight * cov_loss)
+
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -299,7 +350,11 @@ def deep_cv_pca_from_features(
         for x in full_loader:
             k = np.random.randint(1, n_components + 1)
             recon, _ = final_model(x, mask_dim=k)
-            loss = criterion(recon, x)
+
+            recon_loss = criterion(recon, x)
+            cov_loss = covariance_loss(z[:, :k])
+            loss = recon_loss + (cov_weight * cov_loss)
+
             final_optimizer.zero_grad()
             loss.backward()
             final_optimizer.step()
@@ -324,29 +379,8 @@ def deep_cv_pca_from_features(
     torch.save(checkpoint, model_pth_path)
     logging.info(f"Final model saved to {model_pth_path}")
 
-# def covariance_loss(z: torch.Tensor) -> torch.Tensor:
-#     """
-#     Off-diagonal covariance penalty on a batch of latent codes.
 
-#     Ref: Ladjal et al., "A PCA-like Autoencoder" (arXiv:1904.01277)
 
-#     Args:
-#         z: Tensor of shape (batch_size, n_active_components)
-
-#     Returns:
-#         Scalar loss.
-#     """
-#     N, D = z.shape
-#     if N < 2:
-#         return z.new_tensor(0.0)
-
-#     z = z - z.mean(dim=0)
-#     cov = (z.T @ z) / (N - 1)
-
-#     off_diag = cov.clone()
-#     off_diag.fill_diagonal_(0.0)
-
-#     return (off_diag ** 2).sum() / D
 
 
 def add_deep_pca_metrics(
