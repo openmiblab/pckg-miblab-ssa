@@ -349,7 +349,7 @@ def deep_cv_pca_from_features(
         epoch_loss = 0.0
         for x in full_loader:
             k = np.random.randint(1, n_components + 1)
-            recon, _ = final_model(x, mask_dim=k)
+            recon, z = final_model(x, mask_dim=k)
 
             recon_loss = criterion(recon, x)
             cov_loss = covariance_loss(z[:, :k])
@@ -368,7 +368,7 @@ def deep_cv_pca_from_features(
 
     # Save Model Checkpoint
     checkpoint = {
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': final_model.state_dict(),
         'train_mean': dataset.mean,
         'train_std': dataset.std,
         'input_dim': n_features,
