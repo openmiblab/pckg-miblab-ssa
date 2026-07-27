@@ -5,8 +5,11 @@ import pandas as pd
 import torch
 from PIL import Image
 import os
+import logging
 import seaborn as sns
 import glob
+
+from .pca import _elbow_index
 
 
 def plot_deep_pca_performance(
@@ -23,7 +26,7 @@ def plot_deep_pca_performance(
     var_ratio = variance / np.sum(variance)
 
     # 2. Create plot
-    _plot_pca_performance(var_ratio, output_image_path, marginal_mse_path, cumulative_mse_path, n_components)
+    return _plot_pca_performance(var_ratio, output_image_path, marginal_mse_path, cumulative_mse_path, n_components)
 
 
 def plot_pca_performance(
@@ -38,7 +41,7 @@ def plot_pca_performance(
     var_ratio = z_pca['variance_ratio'][:] 
 
     # 2. Create plot
-    _plot_pca_performance(var_ratio, output_image_path, marginal_mse_path, cumulative_mse_path, n_components)
+    return _plot_pca_performance(var_ratio, output_image_path, marginal_mse_path, cumulative_mse_path, n_components)
 
 
 def _plot_pca_performance(var_ratio, output_image_path, marginal_mse_path, cumulative_mse_path, n_components):
@@ -46,6 +49,16 @@ def _plot_pca_performance(var_ratio, output_image_path, marginal_mse_path, cumul
     var_ratio = var_ratio[:limit]
     cum_var_ratio = np.cumsum(var_ratio)
     x_var = np.arange(1, len(var_ratio) + 1)
+
+    # Elbow of the cumulative explained variance curve: the point where the
+    # curve bends furthest from a straight line connecting its endpoints,
+    # i.e. where additional components stop meaningfully adding variance.
+    elbow_idx = _elbow_index(x_var.astype(float), cum_var_ratio)
+    elbow_k = int(x_var[elbow_idx])
+    logging.info(
+        f"PCA performance: Elbow of cumulative explained variance at "
+        f"n_components={elbow_k} ({cum_var_ratio[elbow_idx] * 100:.1f}% variance explained)"
+    )
 
     # 2. Determine Global Y-Max for MSE plots
     global_mse_max = 0
@@ -75,10 +88,15 @@ def _plot_pca_performance(var_ratio, output_image_path, marginal_mse_path, cumul
     axes[0, 0].grid(linestyle='--', alpha=0.5)
 
     axes[0, 1].scatter(x_var, cum_var_ratio, color='firebrick', s=15, alpha=0.8)
+    axes[0, 1].axvline(
+        elbow_k, color='red', linestyle='--', linewidth=1.5,
+        label=f"Elbow (k={elbow_k}, {cum_var_ratio[elbow_idx] * 100:.1f}%)"
+    )
     axes[0, 1].set_title("Cumulative Explained Variance", fontsize=14)
     axes[0, 1].set_ylabel("Total Variance Ratio")
     axes[0, 1].set_ylim(0, 1.05)
     axes[0, 1].grid(linestyle='--', alpha=0.5)
+    axes[0, 1].legend(loc='lower right', fontsize='small')
 
     # --- MSE PLOTTING HELPER ---
     def render_mse_plot(ax, df, title, y_limit):
@@ -125,6 +143,78 @@ def _plot_pca_performance(var_ratio, output_image_path, marginal_mse_path, cumul
 
     plt.tight_layout()
     plt.savefig(output_image_path, dpi=300)
+    plt.show()
+    plt.close()
+
+    return elbow_k
+
+
+def plot_pca_comparison(
+    models: list = None,
+    output_image_path: str = None,
+    n_components: int = None,
+):
+    """
+    Overlays linear vs. deep PCA reconstruction error (median +/- IQR) for one
+    or more representations, one row per representation, for a direct,
+    scale-consistent comparison of the two methods (and, with multiple rows,
+    across representations) in a single figure.
+
+    `models` is a list of dicts, one per representation, each with keys:
+        'name' (str, used in panel titles),
+        'linear_marginal_mse_path', 'linear_cumulative_mse_path',
+        'deep_marginal_mse_path', 'deep_cumulative_mse_path'
+    Any path may be omitted/None to skip that curve.
+
+    Requires pca_performance() and deep_pca_performance() to have been run:
+    both normalize error by ||mean feature vector|| (see pca_performance),
+    so the two curves are on the same scale and safe to overlay.
+    """
+    n_rows = len(models)
+    fig, axes = plt.subplots(n_rows, 2, figsize=(16, 6 * n_rows), squeeze=False)
+
+    for row, model_info in enumerate(models):
+        name = model_info.get('name', f'Model {row + 1}')
+        panels = [
+            (axes[row, 0], model_info.get('linear_marginal_mse_path'), model_info.get('deep_marginal_mse_path'), f"{name}: Marginal Reconstruction Error"),
+            (axes[row, 1], model_info.get('linear_cumulative_mse_path'), model_info.get('deep_cumulative_mse_path'), f"{name}: Cumulative Reconstruction Error"),
+        ]
+
+        for ax, linear_path, deep_path, title in panels:
+            for path, label, line_color, band_color in [
+                (linear_path, 'Linear PCA', 'steelblue', 'lightskyblue'),
+                (deep_path, 'Deep PCA', 'indigo', 'mediumpurple'),
+            ]:
+                if not path:
+                    continue
+
+                df = pd.read_csv(path, index_col=0)
+                if n_components is not None:
+                    df = df.iloc[:, :n_components]
+
+                x_steps = [float(str(c)[3:]) for c in df.columns]  # strip 'PC_' prefix
+                median = df.median(axis=0)
+                q1 = df.quantile(0.25, axis=0)
+                q3 = df.quantile(0.75, axis=0)
+
+                ax.fill_between(x_steps, q1, q3, color=band_color, alpha=0.3)
+                ax.plot(x_steps, median, color=line_color, lw=2, label=f'{label} (median)')
+
+                elbow_idx = _elbow_index(np.asarray(x_steps, dtype=float), median.values)
+                elbow_k = x_steps[elbow_idx]
+                ax.axvline(
+                    elbow_k, color=line_color, linestyle='--', linewidth=1.2, alpha=0.8,
+                    label=f'{label} elbow (k={int(elbow_k)})'
+                )
+
+            ax.set_title(title, fontsize=14)
+            ax.set_xlabel("Number of components")
+            ax.set_ylabel("Reconstruction Error (relative to ||mean||)")
+            ax.grid(linestyle='--', alpha=0.5)
+            ax.legend(loc='best', fontsize='small')
+
+    plt.tight_layout()
+    plt.savefig(output_image_path, dpi=300, bbox_inches='tight')
     plt.show()
     plt.close()
 

@@ -2,12 +2,155 @@ import os
 from typing import Tuple
 import numpy as np
 from sklearn.decomposition import PCA
+from sklearn.model_selection import KFold
 import logging
 from tqdm import tqdm
 import zarr
 import dask.array as da
 import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from dask_ml.decomposition import PCA as daskPCA
+
+
+def _elbow_index(x: np.ndarray, y: np.ndarray) -> int:
+    """
+    Finds the elbow/knee of a curve as the point of maximum perpendicular
+    distance from the chord connecting its first and last point (the
+    standard "distance-to-chord" knee-detection method).
+    """
+    x_norm = (x - x.min()) / (x.max() - x.min())
+    y_norm = (y - y.min()) / (y.max() - y.min())
+
+    start = np.array([x_norm[0], y_norm[0]])
+    end = np.array([x_norm[-1], y_norm[-1]])
+    line_vec = end - start
+    line_vec /= np.linalg.norm(line_vec)
+
+    points = np.stack([x_norm, y_norm], axis=1) - start
+    proj_len = points @ line_vec
+    proj = np.outer(proj_len, line_vec)
+    perp_dist = np.linalg.norm(points - proj, axis=1)
+
+    return int(np.argmax(perp_dist))
+
+
+def pca_cv_from_features_joao(
+    features_zarr_path: str = None,
+    output_plot_path: str = None,
+    max_components: int = None,
+    n_folds: int = 5,
+    step: int = 1,
+    random_state: int = 42,
+):
+    """
+    Cross-validated Scikit-Learn PCA: fits PCA on each training fold and
+    measures held-out reconstruction error across a range of component
+    counts, to help verify linear PCA is behaving sensibly and to pick the
+    number of components that best generalizes (rather than overfitting to
+    the same data PCA was fit on). Loads the entire feature matrix into RAM
+    (see pca_from_features).
+    """
+    logging.info(f"PCA CV: Loading data from {os.path.basename(features_zarr_path)} into RAM...")
+
+    # 1. Load Data from Zarr directly into NumPy
+    feat_root = zarr.open(features_zarr_path, mode='r')
+    data = feat_root['features'][:]
+
+    n_samples, n_features = data.shape
+    # Each fold trains on fewer than n_samples rows (KFold gives some folds one
+    # extra test sample), so n_components is capped by the smallest training
+    # fold's rank, not the full dataset's.
+    max_test_size = -(-n_samples // n_folds)  # ceil division
+    min_train_size = n_samples - max_test_size
+    max_k = min(max_components or (min_train_size - 1), min_train_size - 1, n_features)
+    components_range = np.arange(1, max_k + 1, step)
+
+    logging.info(f"PCA CV: Matrix shape {n_samples}x{n_features}. Running {n_folds}-fold CV over k=1..{max_k}...")
+
+    # 2. Cross-Validate: fit once per fold at max_k, score reconstruction at each k
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+    fold_errors = np.full((n_folds, len(components_range)), np.nan)
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(data)):
+        logging.info(f"PCA CV: Fold {fold + 1}/{n_folds}")
+
+        pca = PCA(n_components=max_k, svd_solver='auto', random_state=random_state)
+        pca.fit(data[train_idx])
+
+        val_centered = data[val_idx] - pca.mean_
+
+        for i, k in enumerate(components_range):
+            basis = pca.components_[:k]
+            scores = val_centered @ basis.T
+            recon = scores @ basis
+            fold_errors[fold, i] = np.mean((val_centered - recon) ** 2)
+
+    mean_error = fold_errors.mean(axis=0)
+    std_error = fold_errors.std(axis=0)
+
+    # Held-out reconstruction MSE is (almost) always monotonically decreasing in k,
+    # so argmin trivially lands on max_k and is not a useful "how many components
+    # do I need" answer. Use the elbow of the curve instead.
+    min_idx = int(np.argmin(mean_error))
+    min_k = int(components_range[min_idx])
+    elbow_idx = _elbow_index(components_range.astype(float), mean_error)
+    optimal_k = int(components_range[elbow_idx])
+
+    logging.info(
+        f"PCA CV: Elbow (recommended) number of components = {optimal_k} "
+        f"(mean val MSE = {mean_error[elbow_idx]:.6f}); "
+        f"lowest mean val MSE reached at k={min_k} (MSE = {mean_error[min_idx]:.6f}, "
+        f"the search ceiling)"
+    )
+
+    # 3. Plot: full-range view (with per-fold curves) + zoomed-in view around the elbow
+    zoom_k = min(max_k, max(optimal_k * 3, 10))
+    zoom_mask = components_range <= zoom_k
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    colors = cm.tab10(np.linspace(0, 1, n_folds))
+
+    for ax, mask, title in [
+        (axes[0], slice(None), f"Full range (k=1..{max_k})"),
+        (axes[1], zoom_mask, f"Zoomed near elbow (k=1..{zoom_k})"),
+    ]:
+        for fold_idx in range(n_folds):
+            ax.plot(
+                components_range[mask], fold_errors[fold_idx][mask],
+                color=colors[fold_idx], alpha=0.35, linewidth=1, label=f"Fold {fold_idx + 1}"
+            )
+        ax.plot(
+            components_range[mask], mean_error[mask],
+            color='black', linewidth=2, label='Mean across folds'
+        )
+        ax.fill_between(
+            components_range[mask],
+            (mean_error - std_error)[mask],
+            (mean_error + std_error)[mask],
+            color='black', alpha=0.12, label='+/- 1 std'
+        )
+        ax.axvline(optimal_k, color='red', linestyle='--', linewidth=1.5, label=f"Elbow (k={optimal_k})")
+        ax.set_xlabel("Number of components")
+        ax.set_ylabel("Validation reconstruction MSE")
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+
+    # Single shared legend (fold lines repeat across panels)
+    handles, labels = axes[0].get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    fig.legend(by_label.values(), by_label.keys(), loc='upper center', ncol=min(len(by_label), 7), bbox_to_anchor=(0.5, 1.05))
+
+    fig.suptitle(f"{n_folds}-Fold Cross-Validated PCA Reconstruction Error", y=1.12)
+    plt.tight_layout()
+
+    os.makedirs(os.path.dirname(output_plot_path) or '.', exist_ok=True)
+    plt.savefig(output_plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    logging.info(f"PCA CV: Plot saved to {output_plot_path}")
+
+    return optimal_k, components_range, mean_error, std_error
 
 
 def pca_from_features(
@@ -500,7 +643,7 @@ def features_from_scores(
     )
     
     # Save labels and copy attributes from PCA root if they exist
-    root.array('labels', data=found_labels.astype(str))
+    root.array('labels', data=np.array(found_labels, dtype='U'))
     
     # Metadata recovery
     root.attrs['original_shape'] = z_pca.attrs.get('original_shape')

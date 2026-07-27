@@ -13,6 +13,7 @@ from .features import (
 )
 from .pca import (
     pca_from_features,
+    pca_cv_from_features_joao,
     dask_pca_from_features,
     direct_pca_from_features,
     pca_from_features, 
@@ -36,6 +37,7 @@ from .data import (
 from .pca_plot import (
     plot_deep_pca_performance,
     plot_pca_performance,
+    plot_pca_comparison,
     plot_pca_reconstruction_performance,
     plot_mask_sections,
     plot_shape_fingerprints,
